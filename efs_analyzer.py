@@ -44,13 +44,27 @@ def setup_logging(error_file=None):
     
     # Error file handler - only show WARNING and above
     if error_file:
-        file_handler = logging.FileHandler(error_file)
-        file_handler.setLevel(logging.WARNING)
-        file_handler.setFormatter(formatter)
-        root_logger.addHandler(file_handler)
+        try:
+            file_handler = logging.FileHandler(error_file, mode='a')
+            file_handler.setLevel(logging.WARNING)
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
+        except Exception as e:
+            # If we can't open the error log, just print a message and continue
+            print(f"Warning: Could not open error log file {error_file}: {e}")
+            print("Errors and warnings will be suppressed but not logged to a file.")
     
     root_logger.addHandler(console_handler)
-    return logging.getLogger('efs-analyzer')
+    
+    # Create a logger for efs-analyzer
+    efs_logger = logging.getLogger('efs-analyzer')
+    
+    # Ensure multiprocessing doesn't cause duplicate logs
+    if multiprocessing.current_process().name != 'MainProcess':
+        # In worker processes, only log to file, not to console
+        console_handler.addFilter(lambda record: False)
+    
+    return efs_logger
 
 # Initialize logger (will be properly configured in main())
 logger = logging.getLogger('efs-analyzer')
@@ -132,6 +146,9 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth=None, curren
     Returns:
         list: List of (category, file_size) tuples
     """
+    # Silence warnings in worker processes to avoid cluttering the console
+    if multiprocessing.current_process().name != 'MainProcess':
+        logging.getLogger().handlers[0].addFilter(lambda record: record.levelno < logging.WARNING)
     results = []
     
     # Check if we've reached the maximum depth
@@ -182,9 +199,29 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth=None, curren
             ))
             
     except PermissionError:
-        logger.warning(f"Permission denied: {directory}")
+        # Log to file only, not to console
+        if multiprocessing.current_process().name == 'MainProcess':
+            logger.warning(f"Permission denied: {directory}")
+        else:
+            # In worker processes, write directly to the error log file if available
+            for handler in logging.getLogger().handlers:
+                if isinstance(handler, logging.FileHandler):
+                    handler.emit(logging.LogRecord(
+                        'efs-analyzer', logging.WARNING, '', 0, 
+                        f"Permission denied: {directory}", (), None))
+                    break
     except Exception as e:
-        logger.warning(f"Error scanning {directory}: {e}")
+        # Log to file only, not to console
+        if multiprocessing.current_process().name == 'MainProcess':
+            logger.warning(f"Error scanning {directory}: {e}")
+        else:
+            # In worker processes, write directly to the error log file if available
+            for handler in logging.getLogger().handlers:
+                if isinstance(handler, logging.FileHandler):
+                    handler.emit(logging.LogRecord(
+                        'efs-analyzer', logging.WARNING, '', 0, 
+                        f"Error scanning {directory}: {e}", (), None))
+                    break
     
     return results
 
@@ -193,12 +230,17 @@ def worker_scan_directory(args):
     Worker function for parallel directory scanning.
     
     Args:
-        args (tuple): (directory, exclude_dirs, current_time, max_depth, worker_id, parallel)
+        args (tuple): (directory, exclude_dirs, current_time, max_depth, worker_id, parallel, error_log)
         
     Returns:
         dict: Dictionary with category counts and sizes
     """
-    directory, exclude_dirs, current_time, max_depth, worker_id, parallel = args
+    directory, exclude_dirs, current_time, max_depth, worker_id, parallel, error_log = args
+    
+    # Configure worker process logging to write errors to file instead of console
+    worker_logger = setup_logging(error_log)
+    global logger
+    logger = worker_logger
     
     # Use internal parallelism for large directories
     results = scan_directory(directory, exclude_dirs, current_time, max_depth, 0, parallel)
@@ -294,9 +336,16 @@ class EFSAnalyzer:
                 logger.info("No subdirectories found, processing mount point directly")
                 top_dirs = [self.mount_path]
             
+            # Get error log path from main process
+            error_log_path = None
+            for handler in logging.getLogger().handlers:
+                if isinstance(handler, logging.FileHandler):
+                    error_log_path = handler.baseFilename
+                    break
+            
             # Prepare arguments for parallel processing
             args_list = [
-                (directory, self.exclude_dirs, self.current_time, self.max_depth, i, max(1, self.parallel // 4))
+                (directory, self.exclude_dirs, self.current_time, self.max_depth, i, max(1, self.parallel // 4), error_log_path)
                 for i, directory in enumerate(top_dirs)
             ]
             
