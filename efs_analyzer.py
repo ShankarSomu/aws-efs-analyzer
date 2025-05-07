@@ -180,11 +180,13 @@ def worker_scan_directory(args):
     
     # Aggregate results
     stats = {category: {'count': 0, 'size': 0} for category in ACCESS_CATEGORIES}
+    file_count = 0
     for category, file_size in results:
         stats[category]['count'] += 1
         stats[category]['size'] += file_size
+        file_count += 1
     
-    return stats, worker_id, str(directory)
+    return stats, worker_id, str(directory), file_count
 
 class EFSAnalyzer:
     """Analyzes EFS mount points for cost optimization opportunities."""
@@ -208,6 +210,7 @@ class EFSAnalyzer:
         self.stats = {category: {'count': 0, 'size': 0} for category in ACCESS_CATEGORIES}
         self.current_time = time.time()
         self._lock = threading.Lock()  # For thread-safe updates to stats
+        self.total_files_scanned = 0  # Counter for total files scanned
         
     def analyze(self):
         """Analyze the EFS mount point."""
@@ -236,7 +239,7 @@ class EFSAnalyzer:
                         
                         root_progress = tqdm.tqdm(
                             total=len(root_files),
-                            desc="Processing root files",
+                            desc=f"Processing root files (0/{len(root_files)})",
                             unit="file",
                             bar_format="{desc}: {percentage:3.1f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
                         )
@@ -249,6 +252,8 @@ class EFSAnalyzer:
                                     with self._lock:
                                         self.stats[category]['count'] += 1
                                         self.stats[category]['size'] += file_size
+                                        self.total_files_scanned += 1
+                                        root_progress.set_description(f"Processing root files ({self.total_files_scanned}/{len(root_files)})")
                             except Exception as e:
                                 logger.debug(f"Error processing root file: {e}")
                             finally:
@@ -275,7 +280,7 @@ class EFSAnalyzer:
             # Create a progress bar in the main process
             progress_bar = tqdm.tqdm(
                 total=total_dirs,
-                desc="Analyzing directories",
+                desc=f"Analyzing directories (0/{total_dirs}) - Files: {self.total_files_scanned:,}",
                 unit="dir",
                 bar_format="{desc}: {percentage:3.1f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
             )
@@ -291,18 +296,18 @@ class EFSAnalyzer:
                 # Process results as they complete
                 for future in as_completed(future_to_dir):
                     try:
-                        dir_stats, worker_id, dir_name = future.result()
+                        dir_stats, worker_id, dir_name, files_processed = future.result()
                         
                         # Merge directory stats into overall stats
                         with self._lock:
                             for category, data in dir_stats.items():
                                 self.stats[category]['count'] += data['count']
                                 self.stats[category]['size'] += data['size']
+                            self.total_files_scanned += files_processed
                         
                         # Update progress bar
                         progress_bar.update(1)
-                        progress_bar.set_description(f"Analyzing directories ({progress_bar.n}/{total_dirs})")progress_bar.n}/{total_dirs})")
-                        
+                        progress_bar.set_description(f"Analyzing directories ({progress_bar.n}/{total_dirs}) - Files: {self.total_files_scanned:,}")
                     except Exception as e:
                         logger.error(f"Error processing directory: {e}")
                         progress_bar.update(1)  # Still update progress even if there was an error
@@ -312,6 +317,8 @@ class EFSAnalyzer:
             
             elapsed_time = time.time() - start_time
             print(f"\nAnalysis completed in {elapsed_time:.2f} seconds")
+            print(f"Total files scanned: {self.total_files_scanned:,}")
+            print(f"Total storage: {humanize.naturalsize(sum(cat['size'] for cat in self.stats.values()))}")
             return self.stats
         except Exception as e:
             logger.error(f"Error during analysis: {e}")
@@ -381,6 +388,7 @@ class EFSAnalyzer:
         report.append(f"Parallel Processes: {self.parallel}")
         if self.max_depth is not None:
             report.append(f"Maximum Scan Depth: {self.max_depth}")
+        report.append(f"Total Files Scanned: {self.total_files_scanned:,}")
         report.append("")
         
         report.append("FILE ACCESS STATISTICS")
@@ -455,6 +463,7 @@ class EFSAnalyzer:
         html.append(f"    <p><strong>Parallel Processes:</strong> {self.parallel}</p>")
         if self.max_depth is not None:
             html.append(f"    <p><strong>Maximum Scan Depth:</strong> {self.max_depth}</p>")
+        html.append(f"    <p><strong>Total Files Scanned:</strong> {self.total_files_scanned:,}</p>")
         
         html.append("    <div class='summary'>")
         html.append("        <h2>Summary</h2>")
