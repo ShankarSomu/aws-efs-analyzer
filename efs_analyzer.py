@@ -92,7 +92,7 @@ def process_file(file_path, current_time):
         logger.debug(f"Error processing file {file_path}: {e}")
         return None
 
-def scan_directory(directory, exclude_dirs, current_time, max_depth=None, current_depth=0):
+def scan_directory(directory, exclude_dirs, current_time, max_depth=None, current_depth=0, parallel=1):
     """
     Scan a directory and collect file statistics.
     
@@ -102,6 +102,7 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth=None, curren
         current_time (float): Current timestamp
         max_depth (int): Maximum depth to scan
         current_depth (int): Current depth
+        parallel (int): Number of parallel processes to use for file processing
         
     Returns:
         list: List of (category, file_size) tuples
@@ -113,6 +114,10 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth=None, curren
         return results
     
     try:
+        # First collect all files and directories
+        files = []
+        subdirs = []
+        
         for item in directory.iterdir():
             # Skip excluded directories
             if item.is_dir() and any(exclude in str(item) for exclude in exclude_dirs):
@@ -120,15 +125,37 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth=None, curren
                 continue
             
             if item.is_file():
-                result = process_file(item, current_time)
+                files.append(item)
+            elif item.is_dir():
+                subdirs.append(item)
+        
+        # Process files in parallel if there are enough files
+        if len(files) > 10 and parallel > 1:
+            with ProcessPoolExecutor(max_workers=min(parallel, len(files))) as executor:
+                file_futures = {executor.submit(process_file, file_path, current_time): file_path 
+                               for file_path in files}
+                
+                for future in as_completed(file_futures):
+                    try:
+                        result = future.result()
+                        if result:
+                            results.append(result)
+                    except Exception as e:
+                        logger.debug(f"Error processing file: {e}")
+        else:
+            # Process files sequentially for small directories
+            for file_path in files:
+                result = process_file(file_path, current_time)
                 if result:
                     results.append(result)
-            elif item.is_dir():
-                # Process subdirectories recursively
-                results.extend(scan_directory(
-                    item, exclude_dirs, current_time, 
-                    max_depth, current_depth + 1
-                ))
+        
+        # Process subdirectories recursively
+        for subdir in subdirs:
+            results.extend(scan_directory(
+                subdir, exclude_dirs, current_time, 
+                max_depth, current_depth + 1, parallel
+            ))
+            
     except PermissionError:
         logger.warning(f"Permission denied: {directory}")
     except Exception as e:
@@ -141,14 +168,15 @@ def worker_scan_directory(args):
     Worker function for parallel directory scanning.
     
     Args:
-        args (tuple): (directory, exclude_dirs, current_time, max_depth, worker_id)
+        args (tuple): (directory, exclude_dirs, current_time, max_depth, worker_id, parallel)
         
     Returns:
         dict: Dictionary with category counts and sizes
     """
-    directory, exclude_dirs, current_time, max_depth, worker_id = args
+    directory, exclude_dirs, current_time, max_depth, worker_id, parallel = args
     
-    results = scan_directory(directory, exclude_dirs, current_time, max_depth)
+    # Use internal parallelism for large directories
+    results = scan_directory(directory, exclude_dirs, current_time, max_depth, 0, parallel)
     
     # Aggregate results
     stats = {category: {'count': 0, 'size': 0} for category in ACCESS_CATEGORIES}
@@ -189,19 +217,44 @@ class EFSAnalyzer:
         try:
             # Get top-level directories for parallel processing
             top_dirs = []
+            root_files = []
             try:
-                # First, process files in the root directory
+                # First, identify files and directories in the root
                 print(f"Scanning root directory: {self.mount_path}")
                 for item in self.mount_path.iterdir():
                     if item.is_file():
-                        result = process_file(item, self.current_time)
-                        if result:
-                            category, file_size = result
-                            with self._lock:
-                                self.stats[category]['count'] += 1
-                                self.stats[category]['size'] += file_size
+                        root_files.append(item)
                     elif item.is_dir() and not any(exclude in str(item) for exclude in self.exclude_dirs):
                         top_dirs.append(item)
+                
+                # Process root files in parallel
+                if root_files:
+                    print(f"Processing {len(root_files)} files in root directory")
+                    with ProcessPoolExecutor(max_workers=self.parallel) as executor:
+                        file_futures = {executor.submit(process_file, file_path, self.current_time): file_path 
+                                       for file_path in root_files}
+                        
+                        root_progress = tqdm.tqdm(
+                            total=len(root_files),
+                            desc="Processing root files",
+                            unit="file",
+                            bar_format="{desc}: {percentage:3.1f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+                        )
+                        
+                        for future in as_completed(file_futures):
+                            try:
+                                result = future.result()
+                                if result:
+                                    category, file_size = result
+                                    with self._lock:
+                                        self.stats[category]['count'] += 1
+                                        self.stats[category]['size'] += file_size
+                            except Exception as e:
+                                logger.debug(f"Error processing root file: {e}")
+                            finally:
+                                root_progress.update(1)
+                        
+                        root_progress.close()
             except Exception as e:
                 logger.error(f"Error processing root directory: {e}")
             
@@ -212,7 +265,7 @@ class EFSAnalyzer:
             
             # Prepare arguments for parallel processing
             args_list = [
-                (directory, self.exclude_dirs, self.current_time, self.max_depth, i)
+                (directory, self.exclude_dirs, self.current_time, self.max_depth, i, max(1, self.parallel // 4))
                 for i, directory in enumerate(top_dirs)
             ]
             
