@@ -22,6 +22,7 @@ The analyzer generates reports in both HTML and plain text formats to help you i
 - Provides recommendations for optimizing storage costs
 - **Parallel processing** for efficient scanning of large file systems
 - **Real-time progress tracking** with completion percentage and ETA
+- **Clean progress display** with errors and warnings redirected to a log file
 
 ## Installation
 
@@ -50,12 +51,13 @@ python efs_analyzer.py /path/to/efs/mount
 - `--exclude`, `-e`: Directories to exclude from analysis
 - `--parallel`, `-p`: Number of parallel processes to use (default: number of CPU cores)
 - `--max-depth`, `-d`: Maximum directory depth to scan (optional)
+- `--error-log`: File to write warnings and errors (default: efs_analyzer_errors.log)
 - `--verbose`, `-v`: Enable verbose logging
 
 ### Example
 
 ```
-python efs_analyzer.py /mnt/efs --output-dir ./reports --exclude tmp cache logs --parallel 8 --max-depth 10 --verbose
+python efs_analyzer.py /mnt/efs --output-dir ./reports --exclude tmp cache logs --parallel 8 --max-depth 10 --error-log errors.log
 ```
 
 ## Reports
@@ -81,6 +83,7 @@ For large file systems:
 - Use the `--parallel` option to specify the number of parallel processes (defaults to the number of CPU cores)
 - Use the `--max-depth` option to limit the scan depth if you only need to analyze the top-level directories
 - Use the `--exclude` option to skip directories that don't need analysis
+- Use the `--error-log` option to redirect warnings and errors to a file, keeping the progress display clean
 
 ## License
 

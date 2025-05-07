@@ -24,10 +24,35 @@ import queue
 import signal
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+def setup_logging(error_file=None):
+    """Set up logging with separate handlers for console and error file."""
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    
+    # Clear any existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Create formatters
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Console handler - only show INFO and above, but not WARNING or ERROR
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    console_handler.addFilter(lambda record: record.levelno < logging.WARNING)
+    
+    # Error file handler - only show WARNING and above
+    if error_file:
+        file_handler = logging.FileHandler(error_file)
+        file_handler.setLevel(logging.WARNING)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+    
+    root_logger.addHandler(console_handler)
+    return logging.getLogger('efs-analyzer')
+
+# Initialize logger (will be properly configured in main())
 logger = logging.getLogger('efs-analyzer')
 
 # EFS pricing (per GB-month in USD)
@@ -215,6 +240,7 @@ class EFSAnalyzer:
     def analyze(self):
         """Analyze the EFS mount point."""
         logger.info(f"Starting analysis of {self.mount_path} with {self.parallel} parallel processes")
+        logger.warning(f"Permission denied and error messages will be written to the error log file")
         start_time = time.time()
         
         try:
@@ -580,9 +606,15 @@ def main():
     parser.add_argument('--exclude', '-e', nargs='+', help='Directories to exclude from analysis')
     parser.add_argument('--parallel', '-p', type=int, help='Number of parallel processes (default: number of CPUs)')
     parser.add_argument('--max-depth', '-d', type=int, help='Maximum directory depth to scan')
+    parser.add_argument('--error-log', help='File to write warnings and errors (default: efs_analyzer_errors.log)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     
     args = parser.parse_args()
+    
+    # Set up error log file
+    error_log = args.error_log or "efs_analyzer_errors.log"
+    global logger
+    logger = setup_logging(error_log)
     
     if args.verbose:
         logger.setLevel(logging.DEBUG)
@@ -609,6 +641,7 @@ def main():
         print(f"\nAnalysis complete!")
         print(f"Text report: {text_path}")
         print(f"HTML report: {html_path}")
+        print(f"Error log: {error_log}")
         
     except Exception as e:
         logger.error(f"Error: {e}")
