@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""
+EFS Analyzer - Analyzes EFS mount points for cost optimization opportunities
+
+This script scans an EFS mount point, categorizes files based on last access time,
+and calculates potential cost savings by moving data to different storage tiers.
+"""
+
+import os
+import time
+import datetime
+import argparse
+import json
+import logging
+from collections import defaultdict
+from pathlib import Path
+import humanize
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('efs-analyzer')
+
+# EFS pricing (per GB-month in USD)
+EFS_PRICING = {
+    'standard': 0.30,  # Standard storage
+    'ia': 0.025,       # Infrequent Access
+    'archive': 0.016   # Archive
+}
+
+# Access time categories in days
+ACCESS_CATEGORIES = {
+    'last_7_days': 7,
+    'last_14_days': 14,
+    'last_30_days': 30,
+    'last_60_days': 60,
+    'last_90_days': 90,
+    'last_1_year': 365,
+    'last_2_years': 730,
+    'older': float('inf')
+}
+
+class EFSAnalyzer:
+    """Analyzes EFS mount points for cost optimization opportunities."""
+    
+    def __init__(self, mount_path, output_dir=None, exclude_dirs=None):
+        """
+        Initialize the EFS Analyzer.
+        
+        Args:
+            mount_path (str): Path to the EFS mount point
+            output_dir (str): Directory to save reports
+            exclude_dirs (list): List of directories to exclude from analysis
+        """
+        self.mount_path = Path(mount_path)
+        self.output_dir = Path(output_dir) if output_dir else Path.cwd()
+        self.exclude_dirs = exclude_dirs or []
+        self.stats = {category: {'count': 0, 'size': 0} for category in ACCESS_CATEGORIES}
+        self.current_time = time.time()
+        
+    def analyze(self):
+        """Analyze the EFS mount point."""
+        logger.info(f"Starting analysis of {self.mount_path}")
+        
+        try:
+            self._scan_directory(self.mount_path)
+            logger.info("Analysis completed successfully")
+            return self.stats
+        except Exception as e:
+            logger.error(f"Error during analysis: {e}")
+            raise
+    
+    def _scan_directory(self, directory):
+        """
+        Recursively scan a directory and collect file statistics.
+        
+        Args:
+            directory (Path): Directory to scan
+        """
+        try:
+            for item in directory.iterdir():
+                # Skip excluded directories
+                if item.is_dir() and any(exclude in str(item) for exclude in self.exclude_dirs):
+                    logger.info(f"Skipping excluded directory: {item}")
+                    continue
+                
+                if item.is_file():
+                    self._process_file(item)
+                elif item.is_dir():
+                    self._scan_directory(item)
+        except PermissionError:
+            logger.warning(f"Permission denied: {directory}")
+        except Exception as e:
+            logger.warning(f"Error scanning {directory}: {e}")
+    
+    def _process_file(self, file_path):
+        """
+        Process a file and update statistics.
+        
+        Args:
+            file_path (Path): Path to the file
+        """
+        try:
+            stat_info = file_path.stat()
+            file_size = stat_info.st_size
+            last_access_time = stat_info.st_atime
+            
+            # Calculate days since last access
+            days_since_access = (self.current_time - last_access_time) / (24 * 3600)
+            
+            # Categorize the file
+            category = self._categorize_file(days_since_access)
+            
+            # Update statistics
+            self.stats[category]['count'] += 1
+            self.stats[category]['size'] += file_size
+            
+        except Exception as e:
+            logger.warning(f"Error processing file {file_path}: {e}")
+    
+    def _categorize_file(self, days_since_access):
+        """
+        Categorize a file based on days since last access.
+        
+        Args:
+            days_since_access (float): Days since last access
+            
+        Returns:
+            str: Category name
+        """
+        for category, threshold in sorted(ACCESS_CATEGORIES.items(), key=lambda x: x[1]):
+            if days_since_access <= threshold:
+                return category
+        return 'older'
+    
+    def calculate_costs(self):
+        """
+        Calculate storage costs for different EFS tiers.
+        
+        Returns:
+            dict: Cost calculations
+        """
+        costs = {}
+        total_size_gb = sum(cat['size'] for cat in self.stats.values()) / (1024 ** 3)
+        
+        # Calculate current cost (assuming all in standard)
+        costs['current'] = total_size_gb * EFS_PRICING['standard']
+        
+        # Calculate optimized cost
+        optimized_cost = 0
+        tier_sizes = {'standard': 0, 'ia': 0, 'archive': 0}
+        
+        # Files accessed within 30 days stay in standard
+        for category in ['last_7_days', 'last_14_days', 'last_30_days']:
+            size_gb = self.stats[category]['size'] / (1024 ** 3)
+            tier_sizes['standard'] += size_gb
+            optimized_cost += size_gb * EFS_PRICING['standard']
+        
+        # Files accessed between 30-90 days go to IA
+        for category in ['last_60_days', 'last_90_days']:
+            size_gb = self.stats[category]['size'] / (1024 ** 3)
+            tier_sizes['ia'] += size_gb
+            optimized_cost += size_gb * EFS_PRICING['ia']
+        
+        # Files older than 90 days go to Archive
+        for category in ['last_1_year', 'last_2_years', 'older']:
+            size_gb = self.stats[category]['size'] / (1024 ** 3)
+            tier_sizes['archive'] += size_gb
+            optimized_cost += size_gb * EFS_PRICING['archive']
+        
+        costs['optimized'] = optimized_cost
+        costs['savings'] = costs['current'] - costs['optimized']
+        costs['savings_percent'] = (costs['savings'] / costs['current'] * 100) if costs['current'] > 0 else 0
+        costs['tier_sizes'] = tier_sizes
+        
+        return costs
+    
+    def generate_text_report(self):
+        """
+        Generate a plain text report.
+        
+        Returns:
+            str: Report content
+        """
+        costs = self.calculate_costs()
+        
+        report = []
+        report.append("=" * 80)
+        report.append("EFS ANALYZER REPORT")
+        report.append("=" * 80)
+        report.append(f"Mount Point: {self.mount_path}")
+        report.append(f"Analysis Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        report.append("")
+        
+        report.append("FILE ACCESS STATISTICS")
+        report.append("-" * 80)
+        report.append(f"{'Category':<20} {'Count':<10} {'Size':<15} {'Percentage':<10}")
+        report.append("-" * 80)
+        
+        total_size = sum(cat['size'] for cat in self.stats.values())
+        for category, data in self.stats.items():
+            size_human = humanize.naturalsize(data['size'])
+            percentage = (data['size'] / total_size * 100) if total_size > 0 else 0
+            report.append(f"{category:<20} {data['count']:<10} {size_human:<15} {percentage:.2f}%")
+        
+        report.append("")
+        report.append("COST ANALYSIS")
+        report.append("-" * 80)
+        report.append(f"Total Storage: {humanize.naturalsize(total_size)}")
+        report.append(f"Current Monthly Cost (Standard tier): ${costs['current']:.2f}")
+        report.append(f"Optimized Monthly Cost: ${costs['optimized']:.2f}")
+        report.append(f"Monthly Savings: ${costs['savings']:.2f} ({costs['savings_percent']:.2f}%)")
+        report.append("")
+        
+        report.append("RECOMMENDED TIER DISTRIBUTION")
+        report.append("-" * 80)
+        report.append(f"Standard tier: {humanize.naturalsize(costs['tier_sizes']['standard'] * (1024 ** 3))}")
+        report.append(f"Infrequent Access tier: {humanize.naturalsize(costs['tier_sizes']['ia'] * (1024 ** 3))}")
+        report.append(f"Archive tier: {humanize.naturalsize(costs['tier_sizes']['archive'] * (1024 ** 3))}")
+        report.append("")
+        
+        report.append("RECOMMENDATIONS")
+        report.append("-" * 80)
+        report.append("1. Consider moving files not accessed in the last 30 days to Infrequent Access tier")
+        report.append("2. Consider moving files not accessed in the last 90 days to Archive tier")
+        report.append("3. Implement lifecycle policies to automatically transition files between tiers")
+        report.append("")
+        
+        return "\n".join(report)
+    
+    def generate_html_report(self):
+        """
+        Generate an HTML report.
+        
+        Returns:
+            str: HTML report content
+        """
+        costs = self.calculate_costs()
+        total_size = sum(cat['size'] for cat in self.stats.values())
+        
+        html = []
+        html.append("<!DOCTYPE html>")
+        html.append("<html lang='en'>")
+        html.append("<head>")
+        html.append("    <meta charset='UTF-8'>")
+        html.append("    <meta name='viewport' content='width=device-width, initial-scale=1.0'>")
+        html.append("    <title>EFS Analyzer Report</title>")
+        html.append("    <style>")
+        html.append("        body { font-family: Arial, sans-serif; margin: 20px; }")
+        html.append("        h1, h2 { color: #0073bb; }")
+        html.append("        table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }")
+        html.append("        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }")
+        html.append("        th { background-color: #f2f2f2; }")
+        html.append("        tr:nth-child(even) { background-color: #f9f9f9; }")
+        html.append("        .savings { color: green; font-weight: bold; }")
+        html.append("        .summary { background-color: #f0f7fb; padding: 15px; border-left: 5px solid #0073bb; }")
+        html.append("    </style>")
+        html.append("</head>")
+        html.append("<body>")
+        
+        html.append("    <h1>EFS Analyzer Report</h1>")
+        html.append(f"    <p><strong>Mount Point:</strong> {self.mount_path}</p>")
+        html.append(f"    <p><strong>Analysis Date:</strong> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>")
+        
+        html.append("    <div class='summary'>")
+        html.append("        <h2>Summary</h2>")
+        html.append(f"        <p>Total Storage: <strong>{humanize.naturalsize(total_size)}</strong></p>")
+        html.append(f"        <p>Current Monthly Cost: <strong>${costs['current']:.2f}</strong></p>")
+        html.append(f"        <p>Optimized Monthly Cost: <strong>${costs['optimized']:.2f}</strong></p>")
+        html.append(f"        <p>Potential Monthly Savings: <span class='savings'>${costs['savings']:.2f} ({costs['savings_percent']:.2f}%)</span></p>")
+        html.append("    </div>")
+        
+        html.append("    <h2>File Access Statistics</h2>")
+        html.append("    <table>")
+        html.append("        <tr>")
+        html.append("            <th>Category</th>")
+        html.append("            <th>File Count</th>")
+        html.append("            <th>Size</th>")
+        html.append("            <th>Percentage</th>")
+        html.append("        </tr>")
+        
+        for category, data in self.stats.items():
+            size_human = humanize.naturalsize(data['size'])
+            percentage = (data['size'] / total_size * 100) if total_size > 0 else 0
+            html.append("        <tr>")
+            html.append(f"            <td>{category.replace('_', ' ').title()}</td>")
+            html.append(f"            <td>{data['count']:,}</td>")
+            html.append(f"            <td>{size_human}</td>")
+            html.append(f"            <td>{percentage:.2f}%</td>")
+            html.append("        </tr>")
+        
+        html.append("    </table>")
+        
+        html.append("    <h2>Recommended Tier Distribution</h2>")
+        html.append("    <table>")
+        html.append("        <tr>")
+        html.append("            <th>Storage Tier</th>")
+        html.append("            <th>Size</th>")
+        html.append("            <th>Monthly Cost</th>")
+        html.append("        </tr>")
+        
+        html.append("        <tr>")
+        html.append("            <td>Standard</td>")
+        html.append(f"            <td>{humanize.naturalsize(costs['tier_sizes']['standard'] * (1024 ** 3))}</td>")
+        html.append(f"            <td>${costs['tier_sizes']['standard'] * EFS_PRICING['standard']:.2f}</td>")
+        html.append("        </tr>")
+        
+        html.append("        <tr>")
+        html.append("            <td>Infrequent Access</td>")
+        html.append(f"            <td>{humanize.naturalsize(costs['tier_sizes']['ia'] * (1024 ** 3))}</td>")
+        html.append(f"            <td>${costs['tier_sizes']['ia'] * EFS_PRICING['ia']:.2f}</td>")
+        html.append("        </tr>")
+        
+        html.append("        <tr>")
+        html.append("            <td>Archive</td>")
+        html.append(f"            <td>{humanize.naturalsize(costs['tier_sizes']['archive'] * (1024 ** 3))}</td>")
+        html.append(f"            <td>${costs['tier_sizes']['archive'] * EFS_PRICING['archive']:.2f}</td>")
+        html.append("        </tr>")
+        
+        html.append("    </table>")
+        
+        html.append("    <h2>Recommendations</h2>")
+        html.append("    <ol>")
+        html.append("        <li>Consider moving files not accessed in the last 30 days to Infrequent Access tier</li>")
+        html.append("        <li>Consider moving files not accessed in the last 90 days to Archive tier</li>")
+        html.append("        <li>Implement lifecycle policies to automatically transition files between tiers</li>")
+        html.append("    </ol>")
+        
+        html.append("    <h2>Cost Comparison Chart</h2>")
+        html.append("    <p>The chart below shows the cost comparison between current and optimized storage configurations:</p>")
+        
+        # Add a simple bar chart using HTML/CSS
+        html.append("    <div style='width: 100%; height: 300px; position: relative;'>")
+        html.append("        <div style='position: absolute; bottom: 0; left: 0; width: 100px; height: 100%;'>")
+        html.append("            <div style='position: absolute; bottom: 0; width: 40px; height: 100%; background-color: #0073bb;'></div>")
+        html.append("            <div style='position: absolute; bottom: 0; left: 50px; width: 40px; height: " + 
+                    f"{(costs['optimized'] / costs['current'] * 100) if costs['current'] > 0 else 0}%" + 
+                    "; background-color: #00bb73;'></div>")
+        html.append("        </div>")
+        html.append("        <div style='position: absolute; bottom: -30px; left: 0;'>Current</div>")
+        html.append("        <div style='position: absolute; bottom: -30px; left: 50px;'>Optimized</div>")
+        html.append("    </div>")
+        
+        html.append("</body>")
+        html.append("</html>")
+        
+        return "\n".join(html)
+    
+    def save_reports(self):
+        """Save reports to files."""
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Create output directory if it doesn't exist
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save text report
+        text_report = self.generate_text_report()
+        text_path = self.output_dir / f"efs_analysis_{timestamp}.txt"
+        with open(text_path, 'w') as f:
+            f.write(text_report)
+        logger.info(f"Text report saved to {text_path}")
+        
+        # Save HTML report
+        html_report = self.generate_html_report()
+        html_path = self.output_dir / f"efs_analysis_{timestamp}.html"
+        with open(html_path, 'w') as f:
+            f.write(html_report)
+        logger.info(f"HTML report saved to {html_path}")
+        
+        return text_path, html_path
+
+def main():
+    """Main function."""
+    parser = argparse.ArgumentParser(description='Analyze EFS mount points for cost optimization')
+    parser.add_argument('mount_path', help='Path to the EFS mount point')
+    parser.add_argument('--output-dir', '-o', help='Directory to save reports')
+    parser.add_argument('--exclude', '-e', nargs='+', help='Directories to exclude from analysis')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
+    
+    args = parser.parse_args()
+    
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+    
+    try:
+        analyzer = EFSAnalyzer(
+            mount_path=args.mount_path,
+            output_dir=args.output_dir,
+            exclude_dirs=args.exclude
+        )
+        
+        analyzer.analyze()
+        text_path, html_path = analyzer.save_reports()
+        
+        print(f"\nAnalysis complete!")
+        print(f"Text report: {text_path}")
+        print(f"HTML report: {html_path}")
+        
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return 1
+    
+    return 0
+
+if __name__ == "__main__":
+    exit(main())
