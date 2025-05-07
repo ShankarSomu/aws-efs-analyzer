@@ -20,6 +20,8 @@ The analyzer generates reports in both HTML and plain text formats to help you i
 - Estimates costs across different EFS storage tiers
 - Generates detailed reports in HTML and plain text formats
 - Provides recommendations for optimizing storage costs
+- **Parallel processing** for efficient scanning of large file systems
+- **Real-time progress tracking** with completion percentage and ETA
 
 ## Installation
 
@@ -46,12 +48,14 @@ python efs_analyzer.py /path/to/efs/mount
 
 - `--output-dir`, `-o`: Directory to save reports (default: current directory)
 - `--exclude`, `-e`: Directories to exclude from analysis
+- `--parallel`, `-p`: Number of parallel processes to use (default: number of CPU cores)
+- `--max-depth`, `-d`: Maximum directory depth to scan (optional)
 - `--verbose`, `-v`: Enable verbose logging
 
 ### Example
 
 ```
-python efs_analyzer.py /mnt/efs --output-dir ./reports --exclude tmp cache logs --verbose
+python efs_analyzer.py /mnt/efs --output-dir ./reports --exclude tmp cache logs --parallel 8 --max-depth 10 --verbose
 ```
 
 ## Reports
@@ -70,6 +74,13 @@ The analyzer recommends the following storage tier strategy:
 - **Standard Tier**: Files accessed within the last 30 days
 - **Infrequent Access Tier**: Files accessed between 30-90 days ago
 - **Archive Tier**: Files not accessed in over 90 days
+
+## Performance Considerations
+
+For large file systems:
+- Use the `--parallel` option to specify the number of parallel processes (defaults to the number of CPU cores)
+- Use the `--max-depth` option to limit the scan depth if you only need to analyze the top-level directories
+- Use the `--exclude` option to skip directories that don't need analysis
 
 ## License
 
