@@ -19,8 +19,9 @@ from pathlib import Path
 import humanize
 import threading
 import tqdm
-import queue
 import sys
+import queue
+import signal
 
 # Configure logging
 logging.basicConfig(
@@ -155,53 +156,7 @@ def worker_scan_directory(args):
         stats[category]['count'] += 1
         stats[category]['size'] += file_size
     
-    return stats, worker_id
-
-class ProgressManager:
-    """Manages progress reporting for parallel tasks."""
-    
-    def __init__(self, total_tasks):
-        """
-        Initialize the progress manager.
-        
-        Args:
-            total_tasks (int): Total number of tasks to track
-        """
-        self.total_tasks = total_tasks
-        self.completed_tasks = 0
-        self.start_time = time.time()
-        self.progress_bar = tqdm.tqdm(
-            total=total_tasks,
-            desc="Analyzing directories",
-            unit="dir",
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
-        )
-        self._lock = threading.Lock()
-    
-    def update(self, n=1):
-        """
-        Update progress by n tasks.
-        
-        Args:
-            n (int): Number of tasks completed
-        """
-        with self._lock:
-            self.completed_tasks += n
-            self.progress_bar.update(n)
-            
-            # Calculate and display ETA
-            if self.completed_tasks > 0:
-                elapsed = time.time() - self.start_time
-                rate = self.completed_tasks / elapsed if elapsed > 0 else 0
-                remaining = (self.total_tasks - self.completed_tasks) / rate if rate > 0 else 0
-                
-                # Update progress bar description with percentage
-                percent = (self.completed_tasks / self.total_tasks) * 100 if self.total_tasks > 0 else 0
-                self.progress_bar.set_description(f"Analyzing directories ({percent:.1f}%)")
-    
-    def close(self):
-        """Close the progress bar."""
-        self.progress_bar.close()
+    return stats, worker_id, str(directory)
 
 class EFSAnalyzer:
     """Analyzes EFS mount points for cost optimization opportunities."""
@@ -261,36 +216,46 @@ class EFSAnalyzer:
                 for i, directory in enumerate(top_dirs)
             ]
             
-            print(f"Found {len(top_dirs)} directories to analyze")
+            total_dirs = len(top_dirs)
+            print(f"Found {total_dirs} directories to analyze")
             
-            # Initialize progress manager
-            progress = ProgressManager(len(top_dirs))
+            # Create a progress bar in the main process
+            progress_bar = tqdm.tqdm(
+                total=total_dirs,
+                desc="Analyzing directories",
+                unit="dir",
+                bar_format="{desc}: {percentage:3.1f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+            )
             
             # Use process pool for parallel scanning
             with ProcessPoolExecutor(max_workers=self.parallel) as executor:
-                futures = {executor.submit(worker_scan_directory, args): args[0] for args in args_list}
+                # Submit all tasks
+                future_to_dir = {
+                    executor.submit(worker_scan_directory, args): args[0]
+                    for args in args_list
+                }
                 
                 # Process results as they complete
-                for future in as_completed(futures):
-                    directory = futures[future]
-                    
+                for future in as_completed(future_to_dir):
                     try:
-                        dir_stats, worker_id = future.result()
+                        dir_stats, worker_id, dir_name = future.result()
+                        
                         # Merge directory stats into overall stats
                         with self._lock:
                             for category, data in dir_stats.items():
                                 self.stats[category]['count'] += data['count']
                                 self.stats[category]['size'] += data['size']
                         
-                        # Update progress
-                        progress.update()
+                        # Update progress bar
+                        progress_bar.update(1)
+                        progress_bar.set_description(f"Analyzing directories ({progress_bar.n}/{total_dirs})")
                         
                     except Exception as e:
-                        logger.error(f"Error processing directory {directory}: {e}")
-                        progress.update()  # Still update progress even if there was an error
+                        logger.error(f"Error processing directory: {e}")
+                        progress_bar.update(1)  # Still update progress even if there was an error
             
             # Close progress bar
-            progress.close()
+            progress_bar.close()
             
             elapsed_time = time.time() - start_time
             print(f"\nAnalysis completed in {elapsed_time:.2f} seconds")
@@ -298,6 +263,10 @@ class EFSAnalyzer:
         except Exception as e:
             logger.error(f"Error during analysis: {e}")
             raise
+        finally:
+            # Make sure we close the progress bar in case of exceptions
+            if 'progress_bar' in locals():
+                progress_bar.close()
     
     def calculate_costs(self):
         """
@@ -557,6 +526,13 @@ def main():
         logger.setLevel(logging.DEBUG)
     
     try:
+        # Handle keyboard interrupts gracefully
+        def signal_handler(sig, frame):
+            print("\nAnalysis interrupted by user. Exiting...")
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        
         analyzer = EFSAnalyzer(
             mount_path=args.mount_path,
             output_dir=args.output_dir,
@@ -579,4 +555,6 @@ def main():
     return 0
 
 if __name__ == "__main__":
+    # Force the output to be unbuffered for better progress bar display
+    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
     exit(main())
