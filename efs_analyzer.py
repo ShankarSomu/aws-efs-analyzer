@@ -248,7 +248,7 @@ class EFSAnalyzer:
                         
                         # Update progress bar
                         progress_bar.update(1)
-                        progress_bar.set_description(f"Analyzing directories ({progress_bar.n}/{total_dirs})")
+                        progress_bar.set_description(f"Analyzing directories ({progress_bar.n}/{total_dirs})")progress_bar.n}/{total_dirs})")
                         
                     except Exception as e:
                         logger.error(f"Error processing directory: {e}")
