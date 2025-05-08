@@ -2,6 +2,8 @@
 
 A Python tool for analyzing Amazon EFS (Elastic File System) mount points to identify cost optimization opportunities.
 
+**IMPORTANT: This tool performs READ-ONLY operations and does not modify any files or change your EFS configuration.**
+
 ## Features
 
 - **Recursive Scanning**: Efficiently scans EFS mount points with parallel processing

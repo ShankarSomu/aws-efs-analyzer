@@ -14,11 +14,18 @@ Features:
 - Real-time progress tracking
 - System directory exclusion and symbolic link loop detection
 
+IMPORTANT: This tool performs READ-ONLY operations and does not modify any files
+or change your EFS configuration. It only analyzes file metadata to provide
+recommendations for potential cost savings.
+
 Usage:
     python efs_analyzer.py /path/to/efs/mount [options]
     
 For root-level directories:
     sudo python efs_analyzer.py / --skip-estimate
+
+For usage examples:
+    python efs_analyzer.py --examples
 """
 
 import os
@@ -729,6 +736,80 @@ def generate_html_report(stats, cost_analysis, output_path):
     
     return output_path
 
+def print_banner():
+    """
+    Print a banner with information about the EFS Analyzer tool.
+    """
+    banner = """
+    ┌─────────────────────────────────────────────────────────┐
+    │                    EFS ANALYZER TOOL                    │
+    ├─────────────────────────────────────────────────────────┤
+    │                                                         │
+    │  This tool analyzes Amazon EFS mount points to identify │
+    │  cost optimization opportunities by:                    │
+    │                                                         │
+    │  • Scanning files and categorizing by last access time  │
+    │  • Calculating potential savings across storage tiers   │
+    │  • Generating detailed reports with recommendations     │
+    │                                                         │
+    │  NOTE: This tool is READ-ONLY and will not modify any   │
+    │        files or change your EFS configuration.          │
+    │                                                         │
+    └─────────────────────────────────────────────────────────┘
+    """
+    print(banner)
+
+def print_examples():
+    """
+    Print usage examples for the EFS Analyzer tool.
+    """
+    examples = """
+EXAMPLES:
+
+Basic usage:
+    python efs_analyzer.py /mnt/efs
+
+Analyze root directory (requires sudo/admin):
+    sudo python efs_analyzer.py / --skip-estimate
+
+Specify parallel processes:
+    python efs_analyzer.py /mnt/efs --parallel 8
+
+Exclude specific directories:
+    python efs_analyzer.py /mnt/efs --exclude cache temp logs
+
+Limit scan depth:
+    python efs_analyzer.py /mnt/efs --max-depth 10
+
+Follow symbolic links:
+    python efs_analyzer.py /mnt/efs --follow-symlinks
+
+Custom output directory:
+    python efs_analyzer.py /mnt/efs --output-dir /path/to/reports
+
+For more information, use the --help option.
+"""
+    print(examples)
+
+def confirm_proceed():
+    """
+    Ask the user for confirmation before proceeding with the scan.
+    
+    Returns:
+        bool: True if the user confirms, False otherwise
+    """
+    while True:
+        response = input("\nThis tool will perform a READ-ONLY scan of your filesystem.\n"
+                         "No changes will be made to your files or EFS configuration.\n"
+                         "Do you want to proceed? [y/n]: ").lower().strip()
+        
+        if response in ('y', 'yes'):
+            return True
+        elif response in ('n', 'no'):
+            return False
+        else:
+            print("Please enter 'y' for yes or 'n' for no.")
+
 def main():
     """
     Main entry point for the EFS Analyzer script.
@@ -741,7 +822,8 @@ def main():
     """
     parser = argparse.ArgumentParser(
         description="EFS Analyzer - Analyzes EFS mount points for cost optimization opportunities",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog="This tool performs READ-ONLY operations and does not modify any files."
     )
     
     parser.add_argument("mount_point", help="EFS mount point to analyze")
@@ -760,8 +842,25 @@ def main():
                       help="Log file for errors and warnings")
     parser.add_argument("--skip-estimate", action="store_true",
                       help="Skip initial file count estimation (faster start)")
+    parser.add_argument("--examples", action="store_true",
+                      help="Show usage examples and exit")
+    parser.add_argument("--yes", "-y", action="store_true",
+                      help="Skip confirmation prompt and proceed with scan")
     
     args = parser.parse_args()
+    
+    # Print banner with tool information
+    print_banner()
+    
+    # Show examples if requested
+    if args.examples:
+        print_examples()
+        return 0
+        
+    # Ask for confirmation unless --yes flag is used
+    if not args.yes and not confirm_proceed():
+        print("Scan cancelled by user.")
+        return 0
     
     # Setup logging
     global logger
@@ -844,6 +943,10 @@ def main():
     print(f"\nReports saved to:")
     print(f"  - Text report: {text_report_path}")
     print(f"  - HTML report: {html_report_path}")
+    
+    print("\nNOTE: No changes have been made to your filesystem or EFS configuration.")
+    print("To implement the recommended optimizations, use the AWS Management Console")
+    print("or AWS CLI to configure lifecycle policies for your EFS filesystem.")
     
     return 0
 

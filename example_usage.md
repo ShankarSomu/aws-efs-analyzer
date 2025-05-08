@@ -1,5 +1,11 @@
 # EFS Analyzer Usage Examples
 
+## Important Note
+
+**This tool performs READ-ONLY operations and does not modify any files or change your EFS configuration.**
+
+It only analyzes file metadata to provide recommendations for potential cost savings.
+
 ## Basic Usage
 
 Analyze an EFS mount point:
@@ -12,6 +18,12 @@ For root-level directories or system directories, use the `--skip-estimate` flag
 
 ```bash
 sudo python efs_analyzer.py / --skip-estimate
+```
+
+You can skip the confirmation prompt with the `-y` or `--yes` flag:
+
+```bash
+python efs_analyzer.py /mnt/efs --yes
 ```
 
 ## Advanced Options
