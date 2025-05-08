@@ -6,7 +6,7 @@ This script scans an EFS mount point, categorizes files based on last access tim
 and calculates potential cost savings by moving data to different storage tiers.
 """
 
-iimport os
+import os
 import sys
 import argparse
 import logging
@@ -14,6 +14,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
+
+# Global logger
+logger = None
 
 def setup_logging(log_file):
     logger = logging.getLogger("directory_scanner")
@@ -29,8 +32,8 @@ def log_error(message, logger):
     logger.error(message)
 
 def scan_directory(directory, exclude_dirs, current_time, max_depth, current_depth,
-                   parallel, follow_symlinks, system_dirs, visited_paths):
-
+                   parallel, follow_symlinks, system_dirs, visited_paths, error_log_path=None):
+    global logger
     file_data = []
     subdirs = []
 
@@ -87,7 +90,7 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth, current_dep
                      max(1, parallel // len(subdirs)), error_log_path, follow_symlinks, system_dirs, visited_paths)
                     for subdir in subdirs
                 ]
-                futures = [executor.submit(process_subdirectory_safe, arg) for arg in subdir_args]
+                futures = [executor.submit(process_subdirectory_safe, args) for args in subdir_args]
                 for future in as_completed(futures):
                     try:
                         result = future.result()
@@ -98,7 +101,7 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth, current_dep
             for subdir in subdirs:
                 result = scan_directory(subdir, exclude_dirs, current_time, max_depth,
                                         current_depth + 1, parallel, follow_symlinks,
-                                        system_dirs, visited_paths)
+                                        system_dirs, visited_paths, error_log_path)
                 file_data.extend(result)
 
     return file_data
@@ -112,7 +115,7 @@ def process_subdirectory(args):
     logger = worker_logger
 
     return scan_directory(subdir, exclude_dirs, current_time, max_depth, current_depth,
-                          parallel, follow_symlinks, system_dirs, visited_paths)
+                          parallel, follow_symlinks, system_dirs, visited_paths, error_log)
 
 def process_subdirectory_safe(args):
     try:
@@ -158,7 +161,8 @@ def main():
         args.parallel,
         args.follow_symlinks,
         system_dirs,
-        visited_paths
+        visited_paths,
+        args.error_log
     )
 
     print_summary(file_data)
