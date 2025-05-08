@@ -2,8 +2,23 @@
 """
 EFS Analyzer - Analyzes EFS mount points for cost optimization opportunities
 
-This script scans an EFS mount point, categorizes files based on last access time,
-and calculates potential cost savings by moving data to different storage tiers.
+This script scans an Amazon EFS (Elastic File System) mount point to identify cost 
+optimization opportunities by categorizing files based on last access time and 
+calculating potential cost savings across different EFS storage tiers.
+
+Features:
+- Recursive scanning with parallel processing for large file systems
+- File categorization based on last access time (7, 14, 30, 60, 90 days, 1-2 years, 2+ years)
+- Cost analysis across different EFS tiers (Standard, Infrequent Access, Archive)
+- Detailed HTML and text reports with visualizations
+- Real-time progress tracking
+- System directory exclusion and symbolic link loop detection
+
+Usage:
+    python efs_analyzer.py /path/to/efs/mount [options]
+    
+For root-level directories:
+    sudo python efs_analyzer.py / --skip-estimate
 """
 
 import os
@@ -39,6 +54,19 @@ start_time = None
 progress_bar = None
 
 class FileStats:
+    """
+    Stores and manages file statistics categorized by last access time.
+    
+    This class maintains counters for file sizes across different access time categories
+    and provides methods to add files and merge statistics from multiple scans.
+    
+    Attributes:
+        categories (dict): Dictionary mapping access time categories to total size in bytes
+        total_size (int): Total size of all files in bytes
+        total_files (int): Total number of files processed
+        errors (int): Count of errors encountered during processing
+    """
+    
     def __init__(self):
         # Initialize categories based on last access time
         self.categories = {
@@ -56,7 +84,16 @@ class FileStats:
         self.errors = 0
 
     def add_file(self, size, last_access_days):
-        """Add a file to the appropriate category based on last access time"""
+        """
+        Add a file to the appropriate category based on last access time.
+        
+        Args:
+            size (int): Size of the file in bytes
+            last_access_days (int): Number of days since the file was last accessed
+            
+        Returns:
+            None
+        """
         self.total_size += size
         self.total_files += 1
         
@@ -78,7 +115,18 @@ class FileStats:
             self.categories["2+_years"] += size
 
     def merge(self, other):
-        """Merge another FileStats object into this one"""
+        """
+        Merge another FileStats object into this one.
+        
+        This method combines statistics from another FileStats object with this one,
+        useful when aggregating results from parallel processing.
+        
+        Args:
+            other (FileStats): Another FileStats object to merge into this one
+            
+        Returns:
+            None
+        """
         self.total_size += other.total_size
         self.total_files += other.total_files
         self.errors += other.errors
@@ -87,7 +135,17 @@ class FileStats:
             self.categories[category] += size
 
 def setup_logging(log_file):
-    """Configure logging to file"""
+    """
+    Configure logging to write messages to a file.
+    
+    Sets up a logger that writes INFO level and above messages to the specified log file.
+    
+    Args:
+        log_file (str): Path to the log file
+        
+    Returns:
+        logging.Logger: Configured logger instance
+    """
     logger = logging.getLogger("efs_analyzer")
     logger.setLevel(logging.INFO)
     
@@ -100,7 +158,19 @@ def setup_logging(log_file):
     return logger
 
 def get_last_access_days(stat_info, current_time):
-    """Calculate days since last access"""
+    """
+    Calculate the number of days since a file was last accessed.
+    
+    Uses the most recent of atime (access time) and mtime (modification time)
+    as some filesystems don't update atime reliably.
+    
+    Args:
+        stat_info (os.stat_result): File stat information from os.stat()
+        current_time (datetime): Current time reference point
+        
+    Returns:
+        int: Number of days since the file was last accessed
+    """
     # Use the most recent of atime and mtime as the "last access"
     # Some filesystems don't update atime reliably
     last_access = max(
@@ -110,28 +180,81 @@ def get_last_access_days(stat_info, current_time):
     return (current_time - last_access).days
 
 def is_system_directory(path, system_dirs):
-    """Check if path is in or under a system directory"""
+    """
+    Check if a path is in or under a system directory that should be excluded.
+    
+    This function determines if a given path should be excluded from scanning
+    by checking if it's within a system directory that typically causes issues
+    or contains virtual files that aren't relevant for storage analysis.
+    
+    Args:
+        path (Path or str): Path to check
+        system_dirs (list): List of Path objects representing system directories to exclude
+        
+    Returns:
+        bool: True if the path is in or under a system directory, False otherwise
+    """
     path_str = str(path)
-    return any(path_str.startswith(str(sys_dir)) for sys_dir in system_dirs)
+    
+    # Check against system_dirs list
+    if any(path_str.startswith(str(sys_dir)) for sys_dir in system_dirs):
+        return True
+    
+    # Additional check for common system directories that should be skipped
+    common_system_dirs = ['/proc', '/sys', '/dev', '/run', '/tmp', '/var/run']
+    path_parts = Path(path_str).parts
+    
+    # Check if any part of the path matches a system directory
+    return any(sys_dir.strip('/') in path_parts for sys_dir in common_system_dirs)
 
 def scan_directory(directory, exclude_dirs, current_time, max_depth, current_depth,
                   follow_symlinks, system_dirs, visited_paths):
     """
-    Scan a directory recursively and collect file statistics
+    Scan a directory recursively and collect file statistics.
+    
+    This function traverses a directory structure, categorizing files by last access time
+    and collecting statistics while handling errors and avoiding system directories.
+    
+    Args:
+        directory (Path): Directory to scan
+        exclude_dirs (list): List of directory names to exclude
+        current_time (datetime): Current time reference point
+        max_depth (int): Maximum recursion depth
+        current_depth (int): Current recursion depth
+        follow_symlinks (bool): Whether to follow symbolic links
+        system_dirs (list): List of system directories to exclude
+        visited_paths (set): Set of already visited paths to avoid loops
+        
+    Returns:
+        FileStats: Object containing statistics about the scanned files
     """
     global processed_files, progress_bar
     
     stats = FileStats()
     subdirs = []
 
+    # First check if this is a system directory we should skip entirely
+    if is_system_directory(directory, system_dirs):
+        if logger:
+            logger.info(f"Skipping system directory: {directory}")
+        return stats
+
     try:
         # Scan current directory
-        for entry in os.scandir(directory):
+        try:
+            dir_entries = list(os.scandir(directory))
+        except (PermissionError, FileNotFoundError) as e:
+            if logger:
+                logger.error(f"Cannot access directory {directory}: {e}")
+            stats.errors += 1
+            return stats
+            
+        for entry in dir_entries:
             try:
                 entry_path = Path(entry.path)
                 
                 # Skip excluded directories
-                if entry.is_dir() and entry.name in exclude_dirs:
+                if entry.is_dir() and (entry.name in exclude_dirs or is_system_directory(entry_path, system_dirs)):
                     continue
                 
                 # Handle symlinks
@@ -149,24 +272,29 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth, current_dep
                     continue
                 
                 # Process files
-                if entry.is_file(follow_symlinks=follow_symlinks):
-                    try:
-                        stat_info = entry.stat(follow_symlinks=follow_symlinks)
-                        last_access_days = get_last_access_days(stat_info, current_time)
-                        stats.add_file(stat_info.st_size, last_access_days)
-                        
-                        processed_files += 1
-                        if progress_bar:
-                            progress_bar.update(1)
-                    except (FileNotFoundError, PermissionError) as e:
-                        stats.errors += 1
-                        if logger:
-                            logger.error(f"Error accessing file {entry.path}: {e}")
-                
-                # Collect subdirectories for recursive scanning
-                elif entry.is_dir(follow_symlinks=follow_symlinks):
-                    if not is_system_directory(entry_path, system_dirs):
-                        subdirs.append(entry_path)
+                try:
+                    if entry.is_file(follow_symlinks=follow_symlinks):
+                        try:
+                            stat_info = entry.stat(follow_symlinks=follow_symlinks)
+                            last_access_days = get_last_access_days(stat_info, current_time)
+                            stats.add_file(stat_info.st_size, last_access_days)
+                            
+                            processed_files += 1
+                            if progress_bar:
+                                progress_bar.update(1)
+                        except (FileNotFoundError, PermissionError, OSError) as e:
+                            stats.errors += 1
+                            if logger:
+                                logger.error(f"Error accessing file {entry.path}: {e}")
+                    
+                    # Collect subdirectories for recursive scanning
+                    elif entry.is_dir(follow_symlinks=follow_symlinks):
+                        if not is_system_directory(entry_path, system_dirs):
+                            subdirs.append(entry_path)
+                except OSError as e:
+                    stats.errors += 1
+                    if logger:
+                        logger.error(f"Error determining file type for {entry.path}: {e}")
             
             except Exception as e:
                 stats.errors += 1
@@ -191,18 +319,62 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth, current_dep
 def parallel_scan_directory(directory, exclude_dirs, current_time, max_depth, 
                            parallel, follow_symlinks, system_dirs):
     """
-    Scan a directory using parallel processing
+    Scan a directory using parallel processing for improved performance.
+    
+    This function coordinates parallel scanning of subdirectories using multiple processes,
+    estimates the total number of files for progress tracking, and aggregates results.
+    
+    Args:
+        directory (str or Path): Root directory to scan
+        exclude_dirs (list): List of directory names to exclude
+        current_time (datetime): Current time reference point
+        max_depth (int): Maximum recursion depth
+        parallel (int): Number of parallel processes to use
+        follow_symlinks (bool): Whether to follow symbolic links
+        system_dirs (list): List of system directories to exclude
+        
+    Returns:
+        FileStats: Object containing aggregated statistics about the scanned files
     """
     global total_files, processed_files, start_time, progress_bar
     
     # Estimate total files for progress tracking
     print("Estimating total files (this may take a while for large filesystems)...")
-    total_files = sum(1 for _ in Path(directory).glob('**/*') if _.is_file())
+    
+    # Use a safer approach to estimate files that avoids permission errors
+    total_files = 0
+    try:
+        # First check if we're scanning a system directory that should be excluded
+        dir_path = Path(directory)
+        if is_system_directory(dir_path, system_dirs):
+            print(f"Warning: {directory} appears to be a system directory. This may cause errors.")
+        
+        # Use os.walk which handles permission errors better than Path.glob
+        for root, _, files in os.walk(directory, topdown=True):
+            # Skip excluded and system directories
+            root_path = Path(root)
+            if any(excluded in root_path.parts for excluded in exclude_dirs) or \
+               is_system_directory(root_path, system_dirs):
+                continue
+                
+            total_files += len(files)
+            
+            # Early exit if we've counted enough files for a reasonable estimate
+            if total_files > 10000:
+                # Multiply by a factor to estimate the total
+                total_files = int(total_files * 1.5)
+                print(f"Found over 10,000 files, estimating approximately {total_files} total files")
+                break
+    except Exception as e:
+        print(f"Error estimating file count: {e}")
+        # Use a default value if estimation fails
+        total_files = 1000
+        print("Using default file count estimate of 1,000 files")
     
     # Initialize progress tracking
     processed_files = 0
     start_time = time.time()
-    progress_bar = tqdm(total=total_files, unit='files')
+    progress_bar = tqdm(total=total_files, unit='files', dynamic_ncols=True)
     
     # First level scan to get subdirectories for parallel processing
     visited_paths = set()
@@ -253,7 +425,28 @@ def parallel_scan_directory(directory, exclude_dirs, current_time, max_depth,
 
 def calculate_costs(stats):
     """
-    Calculate storage costs across different EFS tiers
+    Calculate storage costs across different EFS tiers.
+    
+    This function analyzes file access patterns and calculates current costs
+    (assuming all data is in Standard tier) versus optimized costs (using
+    appropriate tiers based on access patterns).
+    
+    Tier assignment logic:
+    - Standard tier: Files accessed within the last 7 days
+    - Infrequent Access tier: Files accessed between 8-30 days ago
+    - Archive tier: Files not accessed for more than 30 days
+    
+    Args:
+        stats (FileStats): Statistics about the scanned files
+        
+    Returns:
+        dict: Dictionary containing cost analysis results with the following keys:
+            - total_gb: Total storage size in GB
+            - current_cost: Current monthly cost (all in Standard tier)
+            - optimized_cost: Optimized monthly cost using appropriate tiers
+            - monthly_savings: Potential monthly savings
+            - savings_percentage: Savings as a percentage of current cost
+            - tier_distribution: Dictionary mapping tiers to GB allocated to each
     """
     # Convert bytes to GB
     gb_conversion = 1024 * 1024 * 1024
@@ -301,7 +494,19 @@ def calculate_costs(stats):
     }
 
 def generate_text_report(stats, cost_analysis):
-    """Generate a plain text report"""
+    """
+    Generate a plain text report with analysis results.
+    
+    Creates a formatted text report containing file statistics, cost analysis,
+    and recommendations for storage optimization.
+    
+    Args:
+        stats (FileStats): Statistics about the scanned files
+        cost_analysis (dict): Cost analysis results from calculate_costs()
+        
+    Returns:
+        str: Formatted text report
+    """
     report = []
     report.append("=" * 80)
     report.append("EFS STORAGE OPTIMIZATION ANALYSIS REPORT")
@@ -357,7 +562,20 @@ def generate_text_report(stats, cost_analysis):
     return "\n".join(report)
 
 def generate_html_report(stats, cost_analysis, output_path):
-    """Generate an HTML report with visualizations"""
+    """
+    Generate an HTML report with visualizations.
+    
+    Creates an HTML report with charts and tables showing file statistics,
+    cost analysis, and recommendations for storage optimization.
+    
+    Args:
+        stats (FileStats): Statistics about the scanned files
+        cost_analysis (dict): Cost analysis results from calculate_costs()
+        output_path (str): Path where the HTML report will be saved
+        
+    Returns:
+        str: Path to the generated HTML report
+    """
     # Create pie chart for access time distribution
     plt.figure(figsize=(10, 6))
     labels = []
@@ -512,6 +730,15 @@ def generate_html_report(stats, cost_analysis, output_path):
     return output_path
 
 def main():
+    """
+    Main entry point for the EFS Analyzer script.
+    
+    Parses command-line arguments, sets up logging, and coordinates the
+    scanning, analysis, and report generation process.
+    
+    Returns:
+        int: Exit code (0 for success, 1 for error)
+    """
     parser = argparse.ArgumentParser(
         description="EFS Analyzer - Analyzes EFS mount points for cost optimization opportunities",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -531,6 +758,8 @@ def main():
                       help="Directory to store reports")
     parser.add_argument("--log-file", default="efs_analyzer.log",
                       help="Log file for errors and warnings")
+    parser.add_argument("--skip-estimate", action="store_true",
+                      help="Skip initial file count estimation (faster start)")
     
     args = parser.parse_args()
     
@@ -548,16 +777,48 @@ def main():
             Path("/proc"), Path("/sys"), Path("/dev"), Path("/run"),
             Path("/tmp"), Path("/mnt"), Path("/media")
         ]
+        
+    # Add excluded directories to system_dirs
+    for excluded in args.exclude:
+        if not any(str(excluded) in str(sys_dir) for sys_dir in system_dirs):
+            system_dirs.append(Path(f"/{excluded}"))
     
     print(f"Starting EFS analysis of {args.mount_point}")
     print(f"Using {args.parallel} parallel processes")
     
+    # Check if mount point exists
+    if not os.path.exists(args.mount_point):
+        print(f"Error: Mount point {args.mount_point} does not exist")
+        return 1
+        
+    # Check if mount point is accessible
+    if not os.access(args.mount_point, os.R_OK):
+        print(f"Error: Mount point {args.mount_point} is not readable")
+        print("Try running the script with sudo or as root")
+        return 1
+    
     # Start the scan
     current_time = datetime.now()
-    stats = parallel_scan_directory(
-        args.mount_point, args.exclude, current_time,
-        args.max_depth, args.parallel, args.follow_symlinks, system_dirs
-    )
+    
+    # Skip estimation if requested
+    global total_files, progress_bar
+    if args.skip_estimate:
+        print("Skipping file count estimation")
+        total_files = 1000  # Default value
+        processed_files = 0
+        start_time = time.time()
+        progress_bar = tqdm(total=None, unit='files', dynamic_ncols=True)  # Indeterminate progress bar
+        
+        stats = scan_directory(
+            Path(args.mount_point), args.exclude, current_time,
+            args.max_depth, 0, args.follow_symlinks, system_dirs, set()
+        )
+    else:
+        # Use parallel scan with estimation
+        stats = parallel_scan_directory(
+            args.mount_point, args.exclude, current_time,
+            args.max_depth, args.parallel, args.follow_symlinks, system_dirs
+        )
     
     # Calculate costs and savings
     cost_analysis = calculate_costs(stats)
@@ -583,6 +844,8 @@ def main():
     print(f"\nReports saved to:")
     print(f"  - Text report: {text_report_path}")
     print(f"  - HTML report: {html_report_path}")
+    
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -8,6 +8,12 @@ Analyze an EFS mount point:
 python efs_analyzer.py /mnt/efs
 ```
 
+For root-level directories or system directories, use the `--skip-estimate` flag to avoid permission errors:
+
+```bash
+sudo python efs_analyzer.py / --skip-estimate
+```
+
 ## Advanced Options
 
 ### Parallel Processing
