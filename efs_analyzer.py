@@ -6,877 +6,162 @@ This script scans an EFS mount point, categorizes files based on last access tim
 and calculates potential cost savings by moving data to different storage tiers.
 """
 
-import os
-import time
-import datetime
-import argparse
-import json
-import logging
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from collections import defaultdict, Counter
-from pathlib import Path
-import humanize
-import threading
-import tqdm
+iimport os
 import sys
-import queue
-import signal
+import argparse
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import defaultdict
 
-SYSTEM_DIRS = ['/proc', '/sys', '/dev', '/run']
+def setup_logging(log_file):
+    logger = logging.getLogger("directory_scanner")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        fh = logging.FileHandler(log_file)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
+    return logger
 
-# Add this set to track visited paths
-visited_paths = set()
+def log_error(message, logger):
+    logger.error(message)
 
-# Configure logging
-def setup_logging(error_file=None):
-    """Set up logging with separate handlers for console and error file."""
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
-    
-    # Clear any existing handlers
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    
-    # Create formatters
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    
-    # Console handler - only show INFO and above, but not WARNING or ERROR
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    console_handler.addFilter(lambda record: record.levelno < logging.WARNING)
-    
-    # Error file handler - only show WARNING and above
-    if error_file:
-        try:
-            file_handler = logging.FileHandler(error_file, mode='a')
-            file_handler.setLevel(logging.WARNING)
-            file_handler.setFormatter(formatter)
-            root_logger.addHandler(file_handler)
-        except Exception as e:
-            # If we can't open the error log, just print a message and continue
-            print(f"Warning: Could not open error log file {error_file}: {e}")
-            print("Errors and warnings will be suppressed but not logged to a file.")
-    
-    root_logger.addHandler(console_handler)
-    
-    # Create a logger for efs-analyzer
-    efs_logger = logging.getLogger('efs-analyzer')
-    
-    # Ensure multiprocessing doesn't cause duplicate logs
-    if multiprocessing.current_process().name != 'MainProcess':
-        # In worker processes, only log to file, not to console
-        console_handler.addFilter(lambda record: False)
-    
-    return efs_logger
+def scan_directory(directory, exclude_dirs, current_time, max_depth, current_depth,
+                   parallel, follow_symlinks, system_dirs, visited_paths):
 
-# Initialize logger (will be properly configured in main())
-logger = logging.getLogger('efs-analyzer')
+    file_data = []
+    subdirs = []
 
-# EFS pricing (per GB-month in USD)
-EFS_PRICING = {
-    'standard': 0.30,  # Standard storage
-    'ia': 0.025,       # Infrequent Access
-    'archive': 0.016   # Archive
-}
-
-# Access time categories in days
-ACCESS_CATEGORIES = {
-    'last_7_days': 7,
-    'last_14_days': 14,
-    'last_30_days': 30,
-    'last_60_days': 60,
-    'last_90_days': 90,
-    'last_1_year': 365,
-    'last_2_years': 730,
-    'older': float('inf')
-}
-
-def categorize_file(days_since_access):
-    """
-    Categorize a file based on days since last access.
-    
-    Args:
-        days_since_access (float): Days since last access
-        
-    Returns:
-        str: Category name
-    """
-    for category, threshold in sorted(ACCESS_CATEGORIES.items(), key=lambda x: x[1]):
-        if days_since_access <= threshold:
-            return category
-    return 'older'
-
-def process_file(file_path, current_time):
-    """
-    Process a file and return its statistics.
-    
-    Args:
-        file_path (Path): Path to the file
-        current_time (float): Current timestamp
-        
-    Returns:
-        tuple: (category, file_size) or None if error
-    """
     try:
-        stat_info = file_path.stat()
-        file_size = stat_info.st_size
-        last_access_time = stat_info.st_atime
-        
-        # Calculate days since last access
-        days_since_access = (current_time - last_access_time) / (24 * 3600)
-        
-        # Categorize the file
-        category = categorize_file(days_since_access)
-        
-        return (category, file_size)
-        
+        for entry in os.scandir(directory):
+            try:
+                entry_path = Path(entry.path)
+
+                if entry.is_symlink() and not follow_symlinks:
+                    continue
+
+                real_path = entry_path.resolve()
+                if real_path in visited_paths:
+                    continue
+                visited_paths.add(real_path)
+
+                if entry.is_file(follow_symlinks=follow_symlinks):
+                    try:
+                        stat = entry.stat(follow_symlinks=follow_symlinks)
+                        last_modified = datetime.fromtimestamp(stat.st_mtime)
+                        size = stat.st_size
+
+                        if last_modified < current_time - timedelta(days=180):
+                            if size < 1024:
+                                category = 'Category A'
+                            elif size < 1024 * 1024:
+                                category = 'Category B'
+                            elif size < 1024 * 1024 * 1024:
+                                category = 'Category C'
+                            else:
+                                category = 'Category D'
+                            file_data.append((category, size))
+                    except Exception as e:
+                        log_error(f"Error accessing file {entry.path}: {e}", logger)
+
+                elif entry.is_dir(follow_symlinks=follow_symlinks):
+                    subdir_path = entry_path
+                    if subdir_path.name not in exclude_dirs and not any(
+                        str(subdir_path).startswith(str(sys_dir)) for sys_dir in system_dirs
+                    ):
+                        subdirs.append(subdir_path)
+
+            except Exception as e:
+                log_error(f"Error processing entry {entry.path}: {e}", logger)
+
     except Exception as e:
-        logger.debug(f"Error processing file {file_path}: {e}")
-        return None
+        log_error(f"Error scanning directory {directory}: {e}", logger)
 
-def process_subdirectory(args):
-    """
-    Process a subdirectory in parallel.
-    
-    Args:
-        args: Tuple containing (subdir, exclude_dirs, current_time, max_depth, current_depth, parallel, error_log)
-        
-    Returns:
-        List of (category, file_size) tuples
-    """
-    subdir, exclude_dirs, current_time, max_depth, current_depth, parallel, error_log = args
-    
-    # Configure worker process logging
-    worker_logger = setup_logging(error_log)
-    global logger
-    logger = worker_logger
-    
-    return scan_directory(subdir, exclude_dirs, current_time, max_depth, current_depth, parallel)
-
-def scan_directory(directory, exclude_dirs, current_time, max_depth=None, current_depth=0, parallel=1, 
-               follow_symlinks=False, system_dirs=None, visited_paths=None):
-    """
-    Scan a directory and collect file statistics.
-    
-    Args:
-        directory (Path): Directory to scan
-        exclude_dirs (list): List of directories to exclude
-        current_time (float): Current timestamp
-        max_depth (int): Maximum depth to scan
-        current_depth (int): Current depth
-        parallel (int): Number of parallel processes to use for file processing
-        follow_symlinks (bool): Whether to follow symbolic links
-        system_dirs (list): List of system directories to exclude
-        visited_paths (set): Set of already visited paths to detect loops
-        
-    Returns:
-        list: List of (category, file_size) tuples
-    """
-
-    # Convert to absolute path
-    abs_path = os.path.abspath(directory)
-    
-    # Check for system directories
-    if any(abs_path.startswith(sys_dir) for sys_dir in SYSTEM_DIRS):
-        logger.warning(f"Skipping system directory: {directory}")
-        return []
-    
-    # Check for loops (directories we've already visited)
-    if abs_path in visited_paths:
-        logger.warning(f"Loop detected, skipping already visited directory: {directory}")
-        return []    
-    
-    # Silence warnings in worker processes to avoid cluttering the console
-    if multiprocessing.current_process().name != 'MainProcess':
-        logging.getLogger().handlers[0].addFilter(lambda record: record.levelno < logging.WARNING)
-    
-    # Initialize visited paths if not provided
-    if visited_paths is None:
-        visited_paths = set()
-    
-    # Initialize system dirs if not provided
-    if system_dirs is None:
-        system_dirs = []
-    results = []
-    
-    # Check if we've reached the maximum depth
-    if max_depth is not None and current_depth > max_depth:
-        return results
-    
-    try:
-        # First collect all files and directories
-        files = []
-        subdirs = []
-        
-        for item in directory.iterdir():
-            # Skip excluded directories and symbolic links
-            if item.is_symlink():
-                logger.warning(f"Skipping symbolic link: {item}")
-                continue
-                
-            if item.is_dir() and any(exclude in str(item) for exclude in exclude_dirs):
-                logger.warning(f"Skipping excluded directory: {item}")
-                continue
-            
-            if item.is_file():
-                files.append(item)
-            elif item.is_dir():
-                subdirs.append(item)
-        
-        # Process files in parallel if there are enough files
-        if len(files) > 10 and parallel > 1:
-            with ProcessPoolExecutor(max_workers=min(parallel, len(files))) as executor:
-                file_futures = {executor.submit(process_file, file_path, current_time): file_path 
-                               for file_path in files}
-                
-                for future in as_completed(file_futures):
+    if current_depth < max_depth and subdirs:
+        if parallel > 1:
+            with ProcessPoolExecutor(max_workers=parallel) as executor:
+                subdir_args = [
+                    (subdir, exclude_dirs, current_time, max_depth, current_depth + 1,
+                     max(1, parallel // len(subdirs)), error_log_path, follow_symlinks, system_dirs, visited_paths)
+                    for subdir in subdirs
+                ]
+                futures = [executor.submit(process_subdirectory_safe, arg) for arg in subdir_args]
+                for future in as_completed(futures):
                     try:
                         result = future.result()
-                        if result:
-                            results.append(result)
+                        file_data.extend(result)
                     except Exception as e:
-                        logger.debug(f"Error processing file: {e}")
+                        log_error(f"Error processing subdirectory: {e}", logger)
         else:
-            # Process files sequentially for small directories
-            for file_path in files:
-                result = process_file(file_path, current_time)
-                if result:
-                    results.append(result)
-        
-        # Get error log path for subdirectory workers
-        error_log_path = None
-        for handler in logging.getLogger().handlers:
-            if isinstance(handler, logging.FileHandler):
-                error_log_path = handler.baseFilename
-                break
-                
-        # Process subdirectories in parallel if there are enough of them
-        if len(subdirs) > 5 and parallel > 1:
-            # Prepare arguments for parallel processing
-            subdir_args = [
-                (subdir, exclude_dirs, current_time, max_depth, current_depth + 1, 
-                 max(1, parallel // len(subdirs)), error_log_path)
-                for subdir in subdirs
-            ]
-            
-            # Use process pool for parallel subdirectory scanning
-            with ProcessPoolExecutor(max_workers=min(parallel, len(subdirs))) as executor:
-                subdir_futures = {executor.submit(process_subdirectory, args): args[0] 
-                                 for args in subdir_args}
-                
-                for future in as_completed(subdir_futures):
-                    try:
-                        subdir_results = future.result()
-                        results.extend(subdir_results)
-                    except Exception as e:
-                        logger.debug(f"Error processing subdirectory: {e}")
-        else:
-            # Process subdirectories recursively (sequentially)
             for subdir in subdirs:
-                results.extend(scan_directory(
-                    subdir, exclude_dirs, current_time, 
-                    max_depth, current_depth + 1, parallel
-                ))
-            
-    except PermissionError:
-        # Log to file only, not to console
-        if multiprocessing.current_process().name == 'MainProcess':
-            logger.warning(f"Permission denied: {directory}")
-        else:
-            # In worker processes, write directly to the error log file if available
-            for handler in logging.getLogger().handlers:
-                if isinstance(handler, logging.FileHandler):
-                    handler.emit(logging.LogRecord(
-                        'efs-analyzer', logging.WARNING, '', 0, 
-                        f"Permission denied: {directory}", (), None))
-                    break
-    except Exception as e:
-        # Log to file only, not to console
-        if multiprocessing.current_process().name == 'MainProcess':
-            logger.warning(f"Error scanning {directory}: {e}")
-        else:
-            # In worker processes, write directly to the error log file if available
-            for handler in logging.getLogger().handlers:
-                if isinstance(handler, logging.FileHandler):
-                    handler.emit(logging.LogRecord(
-                        'efs-analyzer', logging.WARNING, '', 0, 
-                        f"Error scanning {directory}: {e}", (), None))
-                    break
-    
-    return results
+                result = scan_directory(subdir, exclude_dirs, current_time, max_depth,
+                                        current_depth + 1, parallel, follow_symlinks,
+                                        system_dirs, visited_paths)
+                file_data.extend(result)
 
-def worker_scan_directory(args):
-    """
-    Worker function for parallel directory scanning.
-    
-    Args:
-        args (tuple): (directory, exclude_dirs, current_time, max_depth, worker_id, parallel, error_log)
-        
-    Returns:
-        dict: Dictionary with category counts and sizes
-    """
-    directory, exclude_dirs, current_time, max_depth, worker_id, parallel, error_log = args
-    
-    # Configure worker process logging to write errors to file instead of console
+    return file_data
+
+def process_subdirectory(args):
+    (subdir, exclude_dirs, current_time, max_depth, current_depth, parallel,
+     error_log, follow_symlinks, system_dirs, visited_paths) = args
+
     worker_logger = setup_logging(error_log)
     global logger
     logger = worker_logger
-    
-    # Use internal parallelism for large directories
-    results = scan_directory(directory, exclude_dirs, current_time, max_depth, 0, parallel)
-    
-    # Aggregate results
-    stats = {category: {'count': 0, 'size': 0} for category in ACCESS_CATEGORIES}
-    file_count = 0
-    for category, file_size in results:
-        stats[category]['count'] += 1
-        stats[category]['size'] += file_size
-        file_count += 1
-    
-    return stats, worker_id, str(directory), file_count[category]['count'] += 1
-        stats[category]['size'] += file_size
-        file_count += 1
-    
-    return stats, worker_id, str(directory), file_count
 
-class EFSAnalyzer:
-    """Analyzes EFS mount points for cost optimization opportunities."""
-    
-    def __init__(self, mount_path, output_dir=None, exclude_dirs=None, parallel=None, max_depth=None, follow_symlinks=False):
-        """
-        Initialize the EFS Analyzer.
-        
-        Args:
-            mount_path (str): Path to the EFS mount point
-            output_dir (str): Directory to save reports
-            exclude_dirs (list): List of directories to exclude from analysis
-            parallel (int): Number of parallel processes to use
-            max_depth (int): Maximum directory depth to scan
-            follow_symlinks (bool): Whether to follow symbolic links
-        """
-        self.mount_path = Path(mount_path)
-        self.output_dir = Path(output_dir) if output_dir else Path.cwd()
-        
-        # Default system directories to exclude on Linux/Unix systems
-        self.system_dirs = []
-        if os.name == 'posix':  # Linux/Unix
-            self.system_dirs = [
-                '/proc', '/sys', '/dev', '/run', '/tmp', '/var/tmp',
-                '/var/run', '/var/lock', '/mnt', '/media'
-            ]
-        
-        # Combine user excludes with defaults
-        self.exclude_dirs = exclude_dirs or []
-        
-        self.parallel = parallel or multiprocessing.cpu_count()
-        self.max_depth = max_depth
-        self.follow_symlinks = follow_symlinks
-        self.stats = {category: {'count': 0, 'size': 0} for category in ACCESS_CATEGORIES}
-        self.current_time = time.time()
-        self._lock = threading.Lock()  # For thread-safe updates to stats
-        self.total_files_scanned = 0  # Counter for total files scanned
-        
-        # Set to track visited paths to detect loops
-        self.visited_paths = set()
-        
-    def analyze(self):
-        """Analyze the EFS mount point."""
-        logger.info(f"Starting analysis of {self.mount_path} with {self.parallel} parallel processes")
-        logger.warning(f"Permission denied and error messages will be written to the error log file")
-        start_time = time.time()
-        
-        try:
-            # Get all directories for parallel processing
-            all_dirs = []
-            root_files = []
-            try:
-                # First, identify files and directories in the root
-                print(f"Scanning root directory: {self.mount_path}")
-                
-                # Use a queue for breadth-first directory discovery
-                dir_queue = queue.Queue()
-                dir_queue.put((self.mount_path, 0))  # (directory, depth)
-                
-                # Discover directories up to a certain depth for better parallelism
-                discovery_depth = 2  # Discover directories up to this depth for parallel processing
-                
-                while not dir_queue.empty():
-                    current_dir, depth = dir_queue.get()
-                    
-                    try:
-                        for item in current_dir.iterdir():
-                            # Skip symbolic links
-                            if item.is_symlink():
-                                logger.warning(f"Skipping symbolic link: {item}")
-                                continue
-                                
-                            if item.is_file() and depth == 0:  # Only collect root files
-                                root_files.append(item)
-                            elif item.is_dir():
-                                if not any(exclude in str(item) for exclude in self.exclude_dirs):
-                                    all_dirs.append((item, depth))
-                                    # Add subdirectories to queue if we're not at max discovery depth
-                                    if depth < discovery_depth:
-                                        dir_queue.put((item, depth + 1))
-                                else:
-                                    logger.warning(f"Skipping excluded directory: {item}")
-                    except PermissionError:
-                        logger.warning(f"Permission denied: {current_dir}")
-                    except Exception as e:
-                        logger.warning(f"Error scanning directory {current_dir}: {e}")
-                
-                print(f"Found {len(all_dirs)} directories for parallel processing")
-                
-                # Sort directories by depth to process higher-level directories first
-                all_dirs.sort(key=lambda x: x[1])
-                top_dirs = [d[0] for d in all_dirs]
-                
-                if not top_dirs:
-                    top_dirs = [self.mount_path]
-                    
-            except Exception as e:
-                logger.error(f"Error during directory discovery: {e}")
-                top_dirs = [self.mount_path]
-                
-            try:
-                # Process files in the root directory
-                if root_files:
-                        top_dirs.append(item)
-                
-                # Process root files in parallel
-                if root_files:
-                    print(f"Processing {len(root_files)} files in root directory")
-                    with ProcessPoolExecutor(max_workers=self.parallel) as executor:
-                        file_futures = {executor.submit(process_file, file_path, self.current_time): file_path 
-                                       for file_path in root_files}
-                        
-                        root_progress = tqdm.tqdm(
-                            total=len(root_files),
-                            desc=f"Processing root files (0/{len(root_files)})",
-                            unit="file",
-                            bar_format="{desc}: {percentage:3.1f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
-                        )
-                        
-                        for future in as_completed(file_futures):
-                            try:
-                                result = future.result()
-                                if result:
-                                    category, file_size = result
-                                    with self._lock:
-                                        self.stats[category]['count'] += 1
-                                        self.stats[category]['size'] += file_size
-                                        self.total_files_scanned += 1
-                                        root_progress.set_description(f"Processing root files ({self.total_files_scanned}/{len(root_files)})")
-                            except Exception as e:
-                                logger.debug(f"Error processing root file: {e}")
-                            finally:
-                                root_progress.update(1)
-                        
-                        root_progress.close()
-            except Exception as e:
-                logger.error(f"Error processing root directory: {e}")
-            
-            # If no subdirectories found, process the mount point directly
-            if not top_dirs:
-                logger.info("No subdirectories found, processing mount point directly")
-                top_dirs = [self.mount_path]
-            
-            # Get error log path from main process
-            error_log_path = None
-            for handler in logging.getLogger().handlers:
-                if isinstance(handler, logging.FileHandler):
-                    error_log_path = handler.baseFilename
-                    break
-            
-            # Calculate optimal parallelism distribution
-            total_dirs = len(top_dirs)
-            
-            # Distribute parallel workers based on directory count
-            if total_dirs <= self.parallel:
-                # If we have more workers than directories, give each directory multiple workers
-                workers_per_dir = max(1, self.parallel // total_dirs)
-            else:
-                # If we have more directories than workers, we'll process them in batches
-                workers_per_dir = 1
-            
-            # Prepare arguments for parallel processing
-            args_list = [
-                (directory, self.exclude_dirs, self.current_time, self.max_depth, i, 
-                 workers_per_dir, error_log_path)
-                for i, directory in enumerate(top_dirs)
-            ]
-            
-            total_dirs = len(top_dirs)
-            print(f"Found {total_dirs} directories to analyze")
-            
-            # Create a progress bar in the main process
-            progress_bar = tqdm.tqdm(
-                total=total_dirs,
-                desc=f"Analyzing directories (0/{total_dirs}) - Files: {self.total_files_scanned:,}",
-                unit="dir",
-                bar_format="{desc}: {percentage:3.1f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-                position=0
-            )
-            
-            # Create a second progress bar for file count
-            file_progress = tqdm.tqdm(
-                total=None,  # Unknown total
-                desc="Files processed",
-                unit="files",
-                bar_format="{desc}: {n_fmt} files [{elapsed}, {rate_fmt}]",
-                position=1
-            )
-            
-            # Use process pool for parallel scanning
-            with ProcessPoolExecutor(max_workers=self.parallel) as executor:
-                # Submit all tasks
-                future_to_dir = {
-                    executor.submit(worker_scan_directory, args): args[0]
-                    for args in args_list
-                }
-                
-                # Process results as they complete
-                for future in as_completed(future_to_dir):
-                    try:
-                        dir_stats, worker_id, dir_name, files_processed = future.result()
-                        
-                        # Merge directory stats into overall stats
-                        with self._lock:
-                            for category, data in dir_stats.items():
-                                self.stats[category]['count'] += data['count']
-                                self.stats[category]['size'] += data['size']
-                            self.total_files_scanned += files_processed
-                        
-                        # Update progress bars
-                        progress_bar.update(1)
-                        progress_bar.set_description(f"Analyzing directories ({progress_bar.n}/{total_dirs}) - Files: {self.total_files_scanned:,}")
-                        
-                        # Update file progress
-                        file_progress.update(files_processed)
-                        file_progress.set_description(f"Files processed: {self.total_files_scanned:,}")
-                    except Exception as e:
-                        logger.error(f"Error processing directory: {e}")
-                        progress_bar.update(1)  # Still update progress even if there was an error
-            
-            # Close progress bars
-            progress_bar.close()
-            file_progress.close()
-            
-            elapsed_time = time.time() - start_time
-            print(f"\nAnalysis completed in {elapsed_time:.2f} seconds")
-            print(f"Total files scanned: {self.total_files_scanned:,}")
-            print(f"Total storage: {humanize.naturalsize(sum(cat['size'] for cat in self.stats.values()))}")
-            return self.stats
-        except Exception as e:
-            logger.error(f"Error during analysis: {e}")
-            raise
-        finally:
-            # Make sure we close the progress bars in case of exceptions
-            if 'progress_bar' in locals():
-                progress_bar.close()
-            if 'file_progress' in locals():
-                file_progress.close()
-    
-    def calculate_costs(self):
-        """
-        Calculate storage costs for different EFS tiers.
-        
-        Returns:
-            dict: Cost calculations
-        """
-        costs = {}
-        total_size_gb = sum(cat['size'] for cat in self.stats.values()) / (1024 ** 3)
-        
-        # Calculate current cost (assuming all in standard)
-        costs['current'] = total_size_gb * EFS_PRICING['standard']
-        
-        # Calculate optimized cost
-        optimized_cost = 0
-        tier_sizes = {'standard': 0, 'ia': 0, 'archive': 0}
-        
-        # Files accessed within 30 days stay in standard
-        for category in ['last_7_days', 'last_14_days', 'last_30_days']:
-            size_gb = self.stats[category]['size'] / (1024 ** 3)
-            tier_sizes['standard'] += size_gb
-            optimized_cost += size_gb * EFS_PRICING['standard']
-        
-        # Files accessed between 30-90 days go to IA
-        for category in ['last_60_days', 'last_90_days']:
-            size_gb = self.stats[category]['size'] / (1024 ** 3)
-            tier_sizes['ia'] += size_gb
-            optimized_cost += size_gb * EFS_PRICING['ia']
-        
-        # Files older than 90 days go to Archive
-        for category in ['last_1_year', 'last_2_years', 'older']:
-            size_gb = self.stats[category]['size'] / (1024 ** 3)
-            tier_sizes['archive'] += size_gb
-            optimized_cost += size_gb * EFS_PRICING['archive']
-        
-        costs['optimized'] = optimized_cost
-        costs['savings'] = costs['current'] - costs['optimized']
-        costs['savings_percent'] = (costs['savings'] / costs['current'] * 100) if costs['current'] > 0 else 0
-        costs['tier_sizes'] = tier_sizes
-        
-        return costs
-    
-    def generate_text_report(self):
-        """
-        Generate a plain text report.
-        
-        Returns:
-            str: Report content
-        """
-        costs = self.calculate_costs()
-        
-        report = []
-        report.append("=" * 80)
-        report.append("EFS ANALYZER REPORT")
-        report.append("=" * 80)
-        report.append(f"Mount Point: {self.mount_path}")
-        report.append(f"Analysis Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        report.append(f"Parallel Processes: {self.parallel}")
-        if self.max_depth is not None:
-            report.append(f"Maximum Scan Depth: {self.max_depth}")
-        report.append(f"Total Files Scanned: {self.total_files_scanned:,}")
-        report.append("")
-        
-        report.append("FILE ACCESS STATISTICS")
-        report.append("-" * 80)
-        report.append(f"{'Category':<20} {'Count':<10} {'Size':<15} {'Percentage':<10}")
-        report.append("-" * 80)
-        
-        total_size = sum(cat['size'] for cat in self.stats.values())
-        for category, data in self.stats.items():
-            size_human = humanize.naturalsize(data['size'])
-            percentage = (data['size'] / total_size * 100) if total_size > 0 else 0
-            report.append(f"{category:<20} {data['count']:<10} {size_human:<15} {percentage:.2f}%")
-        
-        report.append("")
-        report.append("COST ANALYSIS")
-        report.append("-" * 80)
-        report.append(f"Total Storage: {humanize.naturalsize(total_size)}")
-        report.append(f"Current Monthly Cost (Standard tier): ${costs['current']:.2f}")
-        report.append(f"Optimized Monthly Cost: ${costs['optimized']:.2f}")
-        report.append(f"Monthly Savings: ${costs['savings']:.2f} ({costs['savings_percent']:.2f}%)")
-        report.append("")
-        
-        report.append("RECOMMENDED TIER DISTRIBUTION")
-        report.append("-" * 80)
-        report.append(f"Standard tier: {humanize.naturalsize(costs['tier_sizes']['standard'] * (1024 ** 3))}")
-        report.append(f"Infrequent Access tier: {humanize.naturalsize(costs['tier_sizes']['ia'] * (1024 ** 3))}")
-        report.append(f"Archive tier: {humanize.naturalsize(costs['tier_sizes']['archive'] * (1024 ** 3))}")
-        report.append("")
-        
-        report.append("RECOMMENDATIONS")
-        report.append("-" * 80)
-        report.append("1. Consider moving files not accessed in the last 30 days to Infrequent Access tier")
-        report.append("2. Consider moving files not accessed in the last 90 days to Archive tier")
-        report.append("3. Implement lifecycle policies to automatically transition files between tiers")
-        report.append("")
-        
-        return "\n".join(report)
-    
-    def generate_html_report(self):
-        """
-        Generate an HTML report.
-        
-        Returns:
-            str: HTML report content
-        """
-        costs = self.calculate_costs()
-        total_size = sum(cat['size'] for cat in self.stats.values())
-        
-        html = []
-        html.append("<!DOCTYPE html>")
-        html.append("<html lang='en'>")
-        html.append("<head>")
-        html.append("    <meta charset='UTF-8'>")
-        html.append("    <meta name='viewport' content='width=device-width, initial-scale=1.0'>")
-        html.append("    <title>EFS Analyzer Report</title>")
-        html.append("    <style>")
-        html.append("        body { font-family: Arial, sans-serif; margin: 20px; }")
-        html.append("        h1, h2 { color: #0073bb; }")
-        html.append("        table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }")
-        html.append("        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }")
-        html.append("        th { background-color: #f2f2f2; }")
-        html.append("        tr:nth-child(even) { background-color: #f9f9f9; }")
-        html.append("        .savings { color: green; font-weight: bold; }")
-        html.append("        .summary { background-color: #f0f7fb; padding: 15px; border-left: 5px solid #0073bb; }")
-        html.append("    </style>")
-        html.append("</head>")
-        html.append("<body>")
-        
-        html.append("    <h1>EFS Analyzer Report</h1>")
-        html.append(f"    <p><strong>Mount Point:</strong> {self.mount_path}</p>")
-        html.append(f"    <p><strong>Analysis Date:</strong> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>")
-        html.append(f"    <p><strong>Parallel Processes:</strong> {self.parallel}</p>")
-        if self.max_depth is not None:
-            html.append(f"    <p><strong>Maximum Scan Depth:</strong> {self.max_depth}</p>")
-        html.append(f"    <p><strong>Total Files Scanned:</strong> {self.total_files_scanned:,}</p>")
-        
-        html.append("    <div class='summary'>")
-        html.append("        <h2>Summary</h2>")
-        html.append(f"        <p>Total Storage: <strong>{humanize.naturalsize(total_size)}</strong></p>")
-        html.append(f"        <p>Current Monthly Cost: <strong>${costs['current']:.2f}</strong></p>")
-        html.append(f"        <p>Optimized Monthly Cost: <strong>${costs['optimized']:.2f}</strong></p>")
-        html.append(f"        <p>Potential Monthly Savings: <span class='savings'>${costs['savings']:.2f} ({costs['savings_percent']:.2f}%)</span></p>")
-        html.append("    </div>")
-        
-        html.append("    <h2>File Access Statistics</h2>")
-        html.append("    <table>")
-        html.append("        <tr>")
-        html.append("            <th>Category</th>")
-        html.append("            <th>File Count</th>")
-        html.append("            <th>Size</th>")
-        html.append("            <th>Percentage</th>")
-        html.append("        </tr>")
-        
-        for category, data in self.stats.items():
-            size_human = humanize.naturalsize(data['size'])
-            percentage = (data['size'] / total_size * 100) if total_size > 0 else 0
-            html.append("        <tr>")
-            html.append(f"            <td>{category.replace('_', ' ').title()}</td>")
-            html.append(f"            <td>{data['count']:,}</td>")
-            html.append(f"            <td>{size_human}</td>")
-            html.append(f"            <td>{percentage:.2f}%</td>")
-            html.append("        </tr>")
-        
-        html.append("    </table>")
-        
-        html.append("    <h2>Recommended Tier Distribution</h2>")
-        html.append("    <table>")
-        html.append("        <tr>")
-        html.append("            <th>Storage Tier</th>")
-        html.append("            <th>Size</th>")
-        html.append("            <th>Monthly Cost</th>")
-        html.append("        </tr>")
-        
-        html.append("        <tr>")
-        html.append("            <td>Standard</td>")
-        html.append(f"            <td>{humanize.naturalsize(costs['tier_sizes']['standard'] * (1024 ** 3))}</td>")
-        html.append(f"            <td>${costs['tier_sizes']['standard'] * EFS_PRICING['standard']:.2f}</td>")
-        html.append("        </tr>")
-        
-        html.append("        <tr>")
-        html.append("            <td>Infrequent Access</td>")
-        html.append(f"            <td>{humanize.naturalsize(costs['tier_sizes']['ia'] * (1024 ** 3))}</td>")
-        html.append(f"            <td>${costs['tier_sizes']['ia'] * EFS_PRICING['ia']:.2f}</td>")
-        html.append("        </tr>")
-        
-        html.append("        <tr>")
-        html.append("            <td>Archive</td>")
-        html.append(f"            <td>{humanize.naturalsize(costs['tier_sizes']['archive'] * (1024 ** 3))}</td>")
-        html.append(f"            <td>${costs['tier_sizes']['archive'] * EFS_PRICING['archive']:.2f}</td>")
-        html.append("        </tr>")
-        
-        html.append("    </table>")
-        
-        html.append("    <h2>Recommendations</h2>")
-        html.append("    <ol>")
-        html.append("        <li>Consider moving files not accessed in the last 30 days to Infrequent Access tier</li>")
-        html.append("        <li>Consider moving files not accessed in the last 90 days to Archive tier</li>")
-        html.append("        <li>Implement lifecycle policies to automatically transition files between tiers</li>")
-        html.append("    </ol>")
-        
-        html.append("    <h2>Cost Comparison Chart</h2>")
-        html.append("    <p>The chart below shows the cost comparison between current and optimized storage configurations:</p>")
-        
-        # Add a simple bar chart using HTML/CSS
-        html.append("    <div style='width: 100%; height: 300px; position: relative;'>")
-        html.append("        <div style='position: absolute; bottom: 0; left: 0; width: 100px; height: 100%;'>")
-        html.append("            <div style='position: absolute; bottom: 0; width: 40px; height: 100%; background-color: #0073bb;'></div>")
-        html.append("            <div style='position: absolute; bottom: 0; left: 50px; width: 40px; height: " + 
-                    f"{(costs['optimized'] / costs['current'] * 100) if costs['current'] > 0 else 0}%" + 
-                    "; background-color: #00bb73;'></div>")
-        html.append("        </div>")
-        html.append("        <div style='position: absolute; bottom: -30px; left: 0;'>Current</div>")
-        html.append("        <div style='position: absolute; bottom: -30px; left: 50px;'>Optimized</div>")
-        html.append("    </div>")
-        
-        html.append("</body>")
-        html.append("</html>")
-        
-        return "\n".join(html)
-    
-    def save_reports(self):
-        """Save reports to files."""
-        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Create output directory if it doesn't exist
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save text report
-        text_report = self.generate_text_report()
-        text_path = self.output_dir / f"efs_analysis_{timestamp}.txt"
-        with open(text_path, 'w') as f:
-            f.write(text_report)
-        logger.info(f"Text report saved to {text_path}")
-        
-        # Save HTML report
-        html_report = self.generate_html_report()
-        html_path = self.output_dir / f"efs_analysis_{timestamp}.html"
-        with open(html_path, 'w') as f:
-            f.write(html_report)
-        logger.info(f"HTML report saved to {html_path}")
-        
-        return text_path, html_path
+    return scan_directory(subdir, exclude_dirs, current_time, max_depth, current_depth,
+                          parallel, follow_symlinks, system_dirs, visited_paths)
+
+def process_subdirectory_safe(args):
+    try:
+        return process_subdirectory(args)
+    except Exception as e:
+        print(f"Unhandled exception in process_subdirectory_safe: {e}")
+        return []
+
+def print_summary(file_data):
+    totals = defaultdict(int)
+    for category, size in file_data:
+        totals[category] += size
+    for category in sorted(totals.keys()):
+        size_in_mb = totals[category] / (1024 * 1024)
+        print(f"{category}: {size_in_mb:.2f} MB")
 
 def main():
-    """Main function."""
-    parser = argparse.ArgumentParser(description='Analyze EFS mount points for cost optimization')
-    parser.add_argument('mount_path', help='Path to the EFS mount point')
-    parser.add_argument('--output-dir', '-o', help='Directory to save reports')
-    parser.add_argument('--exclude', '-e', nargs='+', help='Directories to exclude from analysis')
-    parser.add_argument('--parallel', '-p', type=int, help='Number of parallel processes (default: number of CPUs)')
-    parser.add_argument('--max-depth', '-d', type=int, help='Maximum directory depth to scan')
-    parser.add_argument('--error-log', help='File to write warnings and errors (default: efs_analyzer_errors.log)')
-    parser.add_argument('--follow-symlinks', action='store_true', help='Follow symbolic links (default: skip them)')
-    parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
-    
+    parser = argparse.ArgumentParser(description="Scan a directory and summarize file sizes by category.")
+    parser.add_argument("directory", help="Directory to scan")
+    parser.add_argument("--exclude", nargs='*', default=['proc', 'sys', 'dev', 'run', 'tmp', 'mnt', 'media'],
+                        help="Directories to exclude")
+    parser.add_argument("--max-depth", type=int, default=10, help="Maximum recursion depth")
+    parser.add_argument("--parallel", type=int, default=4, help="Number of parallel workers")
+    parser.add_argument("--follow-symlinks", action="store_true", help="Follow symbolic links")
+    parser.add_argument("--error-log", default="scan_errors.log", help="File to log errors")
+
     args = parser.parse_args()
-    
-    # Set up error log file
-    error_log = args.error_log or "efs_analyzer_errors.log"
+
     global logger
-    logger = setup_logging(error_log)
-    
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-    
-    try:
-        # Handle keyboard interrupts gracefully
-        def signal_handler(sig, frame):
-            print("\nAnalysis interrupted by user. Exiting...")
-            sys.exit(0)
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        
-        analyzer = EFSAnalyzer(
-            mount_path=args.mount_path,
-            output_dir=args.output_dir,
-            exclude_dirs=args.exclude,
-            parallel=args.parallel,
-            max_depth=args.max_depth,
-            follow_symlinks=args.follow_symlinks
-        )
-        
-        analyzer.analyze()
-        text_path, html_path = analyzer.save_reports()
-        
-        print(f"\nAnalysis complete!")
-        print(f"Text report: {text_path}")
-        print(f"HTML report: {html_path}")
-        print(f"Error log: {error_log}")
-        
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        return 1
-    
-    return 0
+    logger = setup_logging(args.error_log)
+
+    system_dirs = [Path("/proc"), Path("/sys"), Path("/dev"), Path("/run"),
+                   Path("/tmp"), Path("/mnt"), Path("/media")]
+    current_time = datetime.now()
+    visited_paths = set()
+
+    file_data = scan_directory(
+        Path(args.directory),
+        args.exclude,
+        current_time,
+        args.max_depth,
+        0,
+        args.parallel,
+        args.follow_symlinks,
+        system_dirs,
+        visited_paths
+    )
+
+    print_summary(file_data)
 
 if __name__ == "__main__":
-    # Force the output to be unbuffered for better progress bar display
-    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
-    exit(main())
+    main()
