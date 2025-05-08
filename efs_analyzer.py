@@ -150,7 +150,8 @@ def process_subdirectory(args):
     
     return scan_directory(subdir, exclude_dirs, current_time, max_depth, current_depth, parallel)
 
-def scan_directory(directory, exclude_dirs, current_time, max_depth=None, current_depth=0, parallel=1):
+def scan_directory(directory, exclude_dirs, current_time, max_depth=None, current_depth=0, parallel=1, 
+               follow_symlinks=False, system_dirs=None, visited_paths=None):
     """
     Scan a directory and collect file statistics.
     
@@ -161,6 +162,9 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth=None, curren
         max_depth (int): Maximum depth to scan
         current_depth (int): Current depth
         parallel (int): Number of parallel processes to use for file processing
+        follow_symlinks (bool): Whether to follow symbolic links
+        system_dirs (list): List of system directories to exclude
+        visited_paths (set): Set of already visited paths to detect loops
         
     Returns:
         list: List of (category, file_size) tuples
@@ -168,6 +172,14 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth=None, curren
     # Silence warnings in worker processes to avoid cluttering the console
     if multiprocessing.current_process().name != 'MainProcess':
         logging.getLogger().handlers[0].addFilter(lambda record: record.levelno < logging.WARNING)
+    
+    # Initialize visited paths if not provided
+    if visited_paths is None:
+        visited_paths = set()
+    
+    # Initialize system dirs if not provided
+    if system_dirs is None:
+        system_dirs = []
     results = []
     
     # Check if we've reached the maximum depth
@@ -329,13 +341,15 @@ class EFSAnalyzer:
         self.output_dir = Path(output_dir) if output_dir else Path.cwd()
         
         # Default system directories to exclude on Linux/Unix systems
-        default_excludes = []
+        self.system_dirs = []
         if os.name == 'posix':  # Linux/Unix
-            default_excludes = ['sys', 'proc', 'dev', 'run', 'tmp', 'mnt', 'media']
+            self.system_dirs = [
+                '/proc', '/sys', '/dev', '/run', '/tmp', '/var/tmp',
+                '/var/run', '/var/lock', '/mnt', '/media'
+            ]
         
         # Combine user excludes with defaults
         self.exclude_dirs = exclude_dirs or []
-        self.exclude_dirs.extend(default_excludes)
         
         self.parallel = parallel or multiprocessing.cpu_count()
         self.max_depth = max_depth
@@ -344,6 +358,9 @@ class EFSAnalyzer:
         self.current_time = time.time()
         self._lock = threading.Lock()  # For thread-safe updates to stats
         self.total_files_scanned = 0  # Counter for total files scanned
+        
+        # Set to track visited paths to detect loops
+        self.visited_paths = set()
         
     def analyze(self):
         """Analyze the EFS mount point."""
