@@ -23,6 +23,11 @@ import sys
 import queue
 import signal
 
+SYSTEM_DIRS = ['/proc', '/sys', '/dev', '/run']
+
+# Add this set to track visited paths
+visited_paths = set()
+
 # Configure logging
 def setup_logging(error_file=None):
     """Set up logging with separate handlers for console and error file."""
@@ -169,6 +174,20 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth=None, curren
     Returns:
         list: List of (category, file_size) tuples
     """
+
+    # Convert to absolute path
+    abs_path = os.path.abspath(directory)
+    
+    # Check for system directories
+    if any(abs_path.startswith(sys_dir) for sys_dir in SYSTEM_DIRS):
+        logger.warning(f"Skipping system directory: {directory}")
+        return []
+    
+    # Check for loops (directories we've already visited)
+    if abs_path in visited_paths:
+        logger.warning(f"Loop detected, skipping already visited directory: {directory}")
+        return []    
+    
     # Silence warnings in worker processes to avoid cluttering the console
     if multiprocessing.current_process().name != 'MainProcess':
         logging.getLogger().handlers[0].addFilter(lambda record: record.levelno < logging.WARNING)
