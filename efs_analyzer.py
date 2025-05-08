@@ -131,6 +131,25 @@ def process_file(file_path, current_time):
         logger.debug(f"Error processing file {file_path}: {e}")
         return None
 
+def process_subdirectory(args):
+    """
+    Process a subdirectory in parallel.
+    
+    Args:
+        args: Tuple containing (subdir, exclude_dirs, current_time, max_depth, current_depth, parallel, error_log)
+        
+    Returns:
+        List of (category, file_size) tuples
+    """
+    subdir, exclude_dirs, current_time, max_depth, current_depth, parallel, error_log = args
+    
+    # Configure worker process logging
+    worker_logger = setup_logging(error_log)
+    global logger
+    logger = worker_logger
+    
+    return scan_directory(subdir, exclude_dirs, current_time, max_depth, current_depth, parallel)
+
 def scan_directory(directory, exclude_dirs, current_time, max_depth=None, current_depth=0, parallel=1):
     """
     Scan a directory and collect file statistics.
@@ -161,9 +180,13 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth=None, curren
         subdirs = []
         
         for item in directory.iterdir():
-            # Skip excluded directories
+            # Skip excluded directories and symbolic links
+            if item.is_symlink():
+                logger.warning(f"Skipping symbolic link: {item}")
+                continue
+                
             if item.is_dir() and any(exclude in str(item) for exclude in exclude_dirs):
-                logger.info(f"Skipping excluded directory: {item}")
+                logger.warning(f"Skipping excluded directory: {item}")
                 continue
             
             if item.is_file():
@@ -191,12 +214,40 @@ def scan_directory(directory, exclude_dirs, current_time, max_depth=None, curren
                 if result:
                     results.append(result)
         
-        # Process subdirectories recursively
-        for subdir in subdirs:
-            results.extend(scan_directory(
-                subdir, exclude_dirs, current_time, 
-                max_depth, current_depth + 1, parallel
-            ))
+        # Get error log path for subdirectory workers
+        error_log_path = None
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, logging.FileHandler):
+                error_log_path = handler.baseFilename
+                break
+                
+        # Process subdirectories in parallel if there are enough of them
+        if len(subdirs) > 5 and parallel > 1:
+            # Prepare arguments for parallel processing
+            subdir_args = [
+                (subdir, exclude_dirs, current_time, max_depth, current_depth + 1, 
+                 max(1, parallel // len(subdirs)), error_log_path)
+                for subdir in subdirs
+            ]
+            
+            # Use process pool for parallel subdirectory scanning
+            with ProcessPoolExecutor(max_workers=min(parallel, len(subdirs))) as executor:
+                subdir_futures = {executor.submit(process_subdirectory, args): args[0] 
+                                 for args in subdir_args}
+                
+                for future in as_completed(subdir_futures):
+                    try:
+                        subdir_results = future.result()
+                        results.extend(subdir_results)
+                    except Exception as e:
+                        logger.debug(f"Error processing subdirectory: {e}")
+        else:
+            # Process subdirectories recursively (sequentially)
+            for subdir in subdirs:
+                results.extend(scan_directory(
+                    subdir, exclude_dirs, current_time, 
+                    max_depth, current_depth + 1, parallel
+                ))
             
     except PermissionError:
         # Log to file only, not to console
@@ -253,12 +304,16 @@ def worker_scan_directory(args):
         stats[category]['size'] += file_size
         file_count += 1
     
+    return stats, worker_id, str(directory), file_count[category]['count'] += 1
+        stats[category]['size'] += file_size
+        file_count += 1
+    
     return stats, worker_id, str(directory), file_count
 
 class EFSAnalyzer:
     """Analyzes EFS mount points for cost optimization opportunities."""
     
-    def __init__(self, mount_path, output_dir=None, exclude_dirs=None, parallel=None, max_depth=None):
+    def __init__(self, mount_path, output_dir=None, exclude_dirs=None, parallel=None, max_depth=None, follow_symlinks=False):
         """
         Initialize the EFS Analyzer.
         
@@ -268,12 +323,23 @@ class EFSAnalyzer:
             exclude_dirs (list): List of directories to exclude from analysis
             parallel (int): Number of parallel processes to use
             max_depth (int): Maximum directory depth to scan
+            follow_symlinks (bool): Whether to follow symbolic links
         """
         self.mount_path = Path(mount_path)
         self.output_dir = Path(output_dir) if output_dir else Path.cwd()
+        
+        # Default system directories to exclude on Linux/Unix systems
+        default_excludes = []
+        if os.name == 'posix':  # Linux/Unix
+            default_excludes = ['sys', 'proc', 'dev', 'run', 'tmp', 'mnt', 'media']
+        
+        # Combine user excludes with defaults
         self.exclude_dirs = exclude_dirs or []
+        self.exclude_dirs.extend(default_excludes)
+        
         self.parallel = parallel or multiprocessing.cpu_count()
         self.max_depth = max_depth
+        self.follow_symlinks = follow_symlinks
         self.stats = {category: {'count': 0, 'size': 0} for category in ACCESS_CATEGORIES}
         self.current_time = time.time()
         self._lock = threading.Lock()  # For thread-safe updates to stats
@@ -286,16 +352,61 @@ class EFSAnalyzer:
         start_time = time.time()
         
         try:
-            # Get top-level directories for parallel processing
-            top_dirs = []
+            # Get all directories for parallel processing
+            all_dirs = []
             root_files = []
             try:
                 # First, identify files and directories in the root
                 print(f"Scanning root directory: {self.mount_path}")
-                for item in self.mount_path.iterdir():
-                    if item.is_file():
-                        root_files.append(item)
-                    elif item.is_dir() and not any(exclude in str(item) for exclude in self.exclude_dirs):
+                
+                # Use a queue for breadth-first directory discovery
+                dir_queue = queue.Queue()
+                dir_queue.put((self.mount_path, 0))  # (directory, depth)
+                
+                # Discover directories up to a certain depth for better parallelism
+                discovery_depth = 2  # Discover directories up to this depth for parallel processing
+                
+                while not dir_queue.empty():
+                    current_dir, depth = dir_queue.get()
+                    
+                    try:
+                        for item in current_dir.iterdir():
+                            # Skip symbolic links
+                            if item.is_symlink():
+                                logger.warning(f"Skipping symbolic link: {item}")
+                                continue
+                                
+                            if item.is_file() and depth == 0:  # Only collect root files
+                                root_files.append(item)
+                            elif item.is_dir():
+                                if not any(exclude in str(item) for exclude in self.exclude_dirs):
+                                    all_dirs.append((item, depth))
+                                    # Add subdirectories to queue if we're not at max discovery depth
+                                    if depth < discovery_depth:
+                                        dir_queue.put((item, depth + 1))
+                                else:
+                                    logger.warning(f"Skipping excluded directory: {item}")
+                    except PermissionError:
+                        logger.warning(f"Permission denied: {current_dir}")
+                    except Exception as e:
+                        logger.warning(f"Error scanning directory {current_dir}: {e}")
+                
+                print(f"Found {len(all_dirs)} directories for parallel processing")
+                
+                # Sort directories by depth to process higher-level directories first
+                all_dirs.sort(key=lambda x: x[1])
+                top_dirs = [d[0] for d in all_dirs]
+                
+                if not top_dirs:
+                    top_dirs = [self.mount_path]
+                    
+            except Exception as e:
+                logger.error(f"Error during directory discovery: {e}")
+                top_dirs = [self.mount_path]
+                
+            try:
+                # Process files in the root directory
+                if root_files:
                         top_dirs.append(item)
                 
                 # Process root files in parallel
@@ -343,9 +454,21 @@ class EFSAnalyzer:
                     error_log_path = handler.baseFilename
                     break
             
+            # Calculate optimal parallelism distribution
+            total_dirs = len(top_dirs)
+            
+            # Distribute parallel workers based on directory count
+            if total_dirs <= self.parallel:
+                # If we have more workers than directories, give each directory multiple workers
+                workers_per_dir = max(1, self.parallel // total_dirs)
+            else:
+                # If we have more directories than workers, we'll process them in batches
+                workers_per_dir = 1
+            
             # Prepare arguments for parallel processing
             args_list = [
-                (directory, self.exclude_dirs, self.current_time, self.max_depth, i, max(1, self.parallel // 4), error_log_path)
+                (directory, self.exclude_dirs, self.current_time, self.max_depth, i, 
+                 workers_per_dir, error_log_path)
                 for i, directory in enumerate(top_dirs)
             ]
             
@@ -357,7 +480,17 @@ class EFSAnalyzer:
                 total=total_dirs,
                 desc=f"Analyzing directories (0/{total_dirs}) - Files: {self.total_files_scanned:,}",
                 unit="dir",
-                bar_format="{desc}: {percentage:3.1f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+                bar_format="{desc}: {percentage:3.1f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+                position=0
+            )
+            
+            # Create a second progress bar for file count
+            file_progress = tqdm.tqdm(
+                total=None,  # Unknown total
+                desc="Files processed",
+                unit="files",
+                bar_format="{desc}: {n_fmt} files [{elapsed}, {rate_fmt}]",
+                position=1
             )
             
             # Use process pool for parallel scanning
@@ -380,15 +513,20 @@ class EFSAnalyzer:
                                 self.stats[category]['size'] += data['size']
                             self.total_files_scanned += files_processed
                         
-                        # Update progress bar
+                        # Update progress bars
                         progress_bar.update(1)
                         progress_bar.set_description(f"Analyzing directories ({progress_bar.n}/{total_dirs}) - Files: {self.total_files_scanned:,}")
+                        
+                        # Update file progress
+                        file_progress.update(files_processed)
+                        file_progress.set_description(f"Files processed: {self.total_files_scanned:,}")
                     except Exception as e:
                         logger.error(f"Error processing directory: {e}")
                         progress_bar.update(1)  # Still update progress even if there was an error
             
-            # Close progress bar
+            # Close progress bars
             progress_bar.close()
+            file_progress.close()
             
             elapsed_time = time.time() - start_time
             print(f"\nAnalysis completed in {elapsed_time:.2f} seconds")
@@ -399,9 +537,11 @@ class EFSAnalyzer:
             logger.error(f"Error during analysis: {e}")
             raise
         finally:
-            # Make sure we close the progress bar in case of exceptions
+            # Make sure we close the progress bars in case of exceptions
             if 'progress_bar' in locals():
                 progress_bar.close()
+            if 'file_progress' in locals():
+                file_progress.close()
     
     def calculate_costs(self):
         """
@@ -656,6 +796,7 @@ def main():
     parser.add_argument('--parallel', '-p', type=int, help='Number of parallel processes (default: number of CPUs)')
     parser.add_argument('--max-depth', '-d', type=int, help='Maximum directory depth to scan')
     parser.add_argument('--error-log', help='File to write warnings and errors (default: efs_analyzer_errors.log)')
+    parser.add_argument('--follow-symlinks', action='store_true', help='Follow symbolic links (default: skip them)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
     
     args = parser.parse_args()
@@ -681,7 +822,8 @@ def main():
             output_dir=args.output_dir,
             exclude_dirs=args.exclude,
             parallel=args.parallel,
-            max_depth=args.max_depth
+            max_depth=args.max_depth,
+            follow_symlinks=args.follow_symlinks
         )
         
         analyzer.analyze()
