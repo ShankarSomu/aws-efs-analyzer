@@ -755,6 +755,9 @@ def print_banner():
     │  NOTE: This tool is READ-ONLY and will not modify any   │
     │        files or change your EFS configuration.          │
     │                                                         │
+    ├─────────────────────────────────────────────────────────┤
+    │  For usage options:  python efs_analyzer.py --help      │
+    │  For examples:       python efs_analyzer.py --examples  │
     └─────────────────────────────────────────────────────────┘
     """
     print(banner)
