@@ -7,7 +7,7 @@ A Python tool for analyzing Amazon EFS (Elastic File System) mount points to ide
 ## Features
 
 - **Recursive Scanning**: Efficiently scans EFS mount points with parallel processing
-- **Access Time Analysis**: Categorizes files based on last access time
+- **Access Time Analysis**: Categorizes files based on last access time (7, 14, 30, 60, 90 days, 1-2 years, 2+ years)
 - **Cost Optimization**: Calculates potential savings across different EFS storage tiers
 - **Comprehensive Reports**: Generates detailed HTML and text reports with visualizations
 - **Performance Optimized**: Handles large file systems with parallel processing
@@ -40,7 +40,45 @@ For more options:
 python efs_analyzer.py --help
 ```
 
-See [example_usage.md](example_usage.md) for detailed usage examples.
+For usage examples:
+
+```bash
+python efs_analyzer.py --examples
+```
+
+For root-level directories (requires sudo/admin):
+
+```bash
+sudo python efs_analyzer.py / --skip-estimate
+```
+
+### Command Line Options
+
+```
+usage: efs_analyzer.py [-h] [--parallel PARALLEL] [--exclude [EXCLUDE ...]]
+                      [--max-depth MAX_DEPTH] [--follow-symlinks]
+                      [--output-dir OUTPUT_DIR] [--log-file LOG_FILE]
+                      [--skip-estimate] [--examples] [--yes]
+                      mount_point
+
+positional arguments:
+  mount_point           EFS mount point to analyze
+
+optional arguments:
+  -h, --help            show this help message and exit
+  --parallel PARALLEL   Number of parallel processes to use (default: number of CPU cores)
+  --exclude [EXCLUDE ...]
+                        Directories to exclude from analysis (default: ['proc', 'sys', 'dev', 'run', 'tmp', 'mnt', 'media'])
+  --max-depth MAX_DEPTH
+                        Maximum directory depth to scan (default: 100)
+  --follow-symlinks     Follow symbolic links (use with caution) (default: False)
+  --output-dir OUTPUT_DIR
+                        Directory to store reports (default: ./reports)
+  --log-file LOG_FILE   Log file for errors and warnings (default: efs_analyzer.log)
+  --skip-estimate       Skip initial file count estimation (faster start) (default: False)
+  --examples            Show usage examples and exit (default: False)
+  --yes, -y             Skip confirmation prompt and proceed with scan (default: False)
+```
 
 ## How It Works
 
@@ -69,6 +107,13 @@ The analyzer uses the following logic for tier recommendations:
 - **Standard Tier**: Files accessed within the last 7 days
 - **Infrequent Access Tier**: Files accessed between 8-30 days ago
 - **Archive Tier**: Files not accessed for more than 30 days
+
+## Performance Considerations
+
+- The tool uses parallel processing which may temporarily increase CPU usage
+- On production servers, consider running during non-peak hours
+- Use the `--parallel` option to limit the number of processes if needed
+- For very large filesystems, use the `--skip-estimate` option for faster startup
 
 ## Contributing
 
