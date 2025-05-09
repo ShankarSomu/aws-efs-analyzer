@@ -756,6 +756,12 @@ def print_banner():
     │        files or change your EFS configuration.          │
     │                                                         │
     ├─────────────────────────────────────────────────────────┤
+    │  CAUTION: This tool uses parallel processing which may  │
+    │  temporarily increase CPU usage. On production servers, │
+    │  please run during non-peak hours or use --parallel     │
+    │  option to limit the number of processes.               │
+    │                                                         │
+    ├─────────────────────────────────────────────────────────┤
     │  For usage options:  python efs_analyzer.py --help      │
     │  For examples:       python efs_analyzer.py --examples  │
     └─────────────────────────────────────────────────────────┘
@@ -803,7 +809,10 @@ def confirm_proceed():
     """
     while True:
         response = input("\nThis tool will perform a READ-ONLY scan of your filesystem.\n"
-                         "No changes will be made to your files or EFS configuration.\n"
+                         "No changes will be made to your files or EFS configuration.\n\n"
+                         "WARNING: This scan uses parallel processing which may temporarily\n"
+                         "increase CPU usage. On production servers, consider running during\n"
+                         "non-peak hours or use the --parallel option to limit CPU usage.\n\n"
                          "Do you want to proceed? [y/n]: ").lower().strip()
         
         if response in ('y', 'yes'):
